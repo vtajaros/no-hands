@@ -129,6 +129,7 @@ class MotionDetector(
             if (isHandTracked) {
                 val frames = consecutiveFrames
                 isHandTracked = false
+                isFirstSampleOfHand = true
                 log("MOTION HAND LOST after $frames frames")
             }
             handleHandLost(timestampMs)
@@ -273,11 +274,26 @@ class MotionDetector(
 
         val oldest = samples.first()
         val newest = samples.last()
-        val duration = newest.timestampMs - oldest.timestampMs
 
-        // dy: positive means the hand moved UP on screen (newest.y < oldest.y)
-        val dy = (oldest.y - newest.y) / handSize
-        val dx = (newest.x - oldest.x) / handSize
+        // Net movement between oldest and newest
+        val netDy = (oldest.y - newest.y) / handSize
+        val netDx = (newest.x - oldest.x) / handSize
+        val netDuration = newest.timestampMs - oldest.timestampMs
+
+        // Evaluate candidate with largest excursion from oldest in the same direction as net movement
+        var bestExcursionDy = netDy
+        var bestExcursionDx = netDx
+        var bestExcursionDuration = netDuration
+
+        for (s in samples) {
+            val sDy = (oldest.y - s.y) / handSize
+            val sameDirection = (netDy > 0f && sDy > 0f) || (netDy < 0f && sDy < 0f)
+            if (sameDirection && abs(sDy) > abs(bestExcursionDy)) {
+                bestExcursionDy = sDy
+                bestExcursionDx = (s.x - oldest.x) / handSize
+                bestExcursionDuration = s.timestampMs - oldest.timestampMs
+            }
+        }
 
         // Peak instantaneous speed between consecutive samples in the window
         var peakSpeed = 0f
@@ -296,8 +312,34 @@ class MotionDetector(
             }
         }
 
+        // Displacement check from best consistent stroke:
+        // Use newest vs bestExcursion. Whichever gives the larger |dy| (as long as it moves in same direction) is used.
+        // If bestExcursion passes, prefer it (larger |dy|). If not, fall back to newest if newest passes.
+        val checkPass = { candDy: Float, candDx: Float, candDur: Long ->
+            val disp = abs(candDy) >= config.minDisplacementHands
+            val vert = abs(candDy) >= config.verticalDominance * abs(candDx)
+            val dur = candDur in config.minDurationMs..config.maxDurationMs
+            val spd = peakSpeed >= config.minPeakSpeedHandsPerSec
+            disp && vert && dur && spd
+        }
+
+        val bestPasses = checkPass(bestExcursionDy, bestExcursionDx, bestExcursionDuration)
+        val newestPasses = checkPass(netDy, netDx, netDuration)
+
+        val (chosenDy, chosenDx, chosenDuration) = when {
+            bestPasses -> Triple(bestExcursionDy, bestExcursionDx, bestExcursionDuration)
+            newestPasses -> Triple(netDy, netDx, netDuration)
+            abs(bestExcursionDy) >= abs(netDy) -> Triple(bestExcursionDy, bestExcursionDx, bestExcursionDuration)
+            else -> Triple(netDy, netDx, netDuration)
+        }
+
+        val dy = chosenDy
+        val dx = chosenDx
+        val duration = chosenDuration
         val absDy = abs(dy)
         val absDx = abs(dx)
+
+        currentWindowedDy = chosenDy
 
         // Track max values for 1-second summary
         if (absDy > maxAbsDyInSec) maxAbsDyInSec = absDy

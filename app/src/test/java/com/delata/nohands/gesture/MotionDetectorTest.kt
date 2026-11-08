@@ -65,8 +65,8 @@ class MotionDetectorTest {
         assertEquals("Expected exactly one swipe event", 1, events.size)
         val event = events.first()
         assertEquals(SwipeDirection.UP, event.direction)
-        assertTrue("Displacement should be at least 1.0 hand sizes", event.displacement >= 1.0f)
-        assertTrue("Peak speed should exceed threshold", event.peakSpeed >= 3.5f)
+        assertTrue("Displacement should be at least 0.30 hand sizes", event.displacement >= 0.30f)
+        assertTrue("Peak speed should exceed threshold", event.peakSpeed >= 2.5f)
     }
 
     @Test
@@ -224,8 +224,8 @@ class MotionDetectorTest {
         detector.onFrame(t, createSyntheticHand(0.5f, startY - 0.05f))?.let { events.add(it) }
         t += 40L
 
-        // Hand disappears for 320 ms (> 250 ms grace period)
-        for (i in 0 until 8) {
+        // Hand disappears for 480 ms (> 400 ms grace period)
+        for (i in 0 until 12) {
             detector.onFrame(t, null)?.let { events.add(it) }
             t += 40L
         }
@@ -312,8 +312,8 @@ class MotionDetectorTest {
             logs.any { it == "MOTION HAND LOST after 4 frames" }
         )
 
-        // Hand missing for > 250 ms (e.g. 7 frames = 280 ms)
-        for (i in 0 until 7) {
+        // Hand missing for > 400 ms (e.g. 11 frames = 440 ms)
+        for (i in 0 until 11) {
             loggedDetector.onFrame(t, null)
             t += 40L
         }
@@ -369,5 +369,142 @@ class MotionDetectorTest {
             "Expected MOTION SETTLING log while settling",
             logs.any { it.startsWith("MOTION SETTLING speed=") }
         )
+    }
+
+    @Test
+    fun stroke250ms_035HandSize_emitsUp() {
+        // A 0.35 hand-size upward stroke over 250 ms at ~20 fps (50 ms step)
+        val events = mutableListOf<SwipeEvent>()
+        val handSize = 0.20f
+        val startY = 0.60f
+        var t = 0L
+
+        // Initial frames to stabilize hand tracking
+        detector.onFrame(t, createSyntheticHand(0.5f, startY, handSize))?.let { events.add(it) }
+        t += 50L
+        detector.onFrame(t, createSyntheticHand(0.5f, startY, handSize))?.let { events.add(it) }
+        t += 50L
+
+        // 250 ms stroke (5 steps of 50 ms from t = 100 to t = 300 ms, or t = 50 to 300 ms)
+        // Reaches peak speed > 2.5 hand sizes/s during the flick phase and total displacement of 0.35 hand sizes
+        val yPositions = listOf(
+            startY - 0.03f * handSize,
+            startY - 0.28f * handSize,
+            startY - 0.33f * handSize,
+            startY - 0.35f * handSize
+        )
+        for (y in yPositions) {
+            detector.onFrame(t, createSyntheticHand(0.5f, y, handSize))?.let { events.add(it) }
+            t += 50L
+        }
+
+        // Additional still frames after stroke
+        for (i in 0 until 3) {
+            detector.onFrame(t, createSyntheticHand(0.5f, startY - 0.35f * handSize, handSize))?.let { events.add(it) }
+            t += 50L
+        }
+
+        assertEquals("Expected exactly one UP swipe event", 1, events.size)
+        val event = events.first()
+        assertEquals(SwipeDirection.UP, event.direction)
+        assertTrue("Displacement should be at least 0.30 hand sizes", event.displacement >= 0.30f)
+        assertTrue("Peak speed should be at least 2.5 hand sizes/s", event.peakSpeed >= 2.5f)
+    }
+
+    @Test
+    fun stroke020HandSize_emitsNothing() {
+        // A 0.20 hand-size stroke (< 0.30 threshold)
+        val events = mutableListOf<SwipeEvent>()
+        val handSize = 0.20f
+        val startY = 0.60f
+        var t = 0L
+
+        for (i in 0 until 2) {
+            detector.onFrame(t, createSyntheticHand(0.5f, startY, handSize))?.let { events.add(it) }
+            t += 40L
+        }
+
+        // Fast upward flick but only 0.20 hand sizes (0.04 normalized)
+        val flickFrames = 4
+        val totalDeltaNorm = 0.20f * handSize
+        for (i in 1..flickFrames) {
+            val y = startY - totalDeltaNorm * (i.toFloat() / flickFrames)
+            detector.onFrame(t, createSyntheticHand(0.5f, y, handSize))?.let { events.add(it) }
+            t += 40L
+        }
+
+        for (i in 0 until 3) {
+            detector.onFrame(t, createSyntheticHand(0.5f, startY - totalDeltaNorm, handSize))?.let { events.add(it) }
+            t += 40L
+        }
+
+        assertTrue("0.20 hand-size stroke must emit nothing", events.isEmpty())
+    }
+
+    @Test
+    fun strokeWith300msTrackingGap_emitsOnceViaBridging() {
+        // A stroke with a 300 ms tracking gap in the middle emits once (grace bridging) and emits nothing during the gap
+        val events = mutableListOf<SwipeEvent>()
+        val handSize = 0.20f
+        val startY = 0.60f
+        var t = 0L
+
+        // Initial frames with hand present
+        detector.onFrame(t, createSyntheticHand(0.5f, startY, handSize))?.let { events.add(it) }
+        t += 50L
+        // Stroke starts: last sample before gap at t = 50 ms
+        val beforeGapY = startY - 0.05f * handSize
+        detector.onFrame(t, createSyntheticHand(0.5f, beforeGapY, handSize))?.let { events.add(it) }
+        t += 50L
+
+        // 300 ms tracking gap: from t = 100 to t = 350 (hand is null)
+        val gapEvents = mutableListOf<SwipeEvent>()
+        while (t < 350L) {
+            detector.onFrame(t, null)?.let { gapEvents.add(it) }
+            t += 50L
+        }
+        assertTrue("Must emit nothing during tracking gap", gapEvents.isEmpty())
+
+        // Hand reappears at t = 350 (gap from t = 50 to t = 350 is exactly 300 ms <= windowMs)
+        // Hand reappears at end of stroke: upward movement of 0.80 hand sizes from beforeGapY
+        val afterGapY = beforeGapY - 0.80f * handSize
+        detector.onFrame(t, createSyntheticHand(0.5f, afterGapY, handSize))?.let { events.add(it) }
+        t += 50L
+
+        // Subsequent still frames during cooldown
+        for (i in 0 until 3) {
+            detector.onFrame(t, createSyntheticHand(0.5f, afterGapY, handSize))?.let { events.add(it) }
+            t += 50L
+        }
+
+        assertEquals("Expected exactly one swipe event via bridging", 1, events.size)
+        assertEquals(SwipeDirection.UP, events.first().direction)
+        assertTrue("Displacement should be at least 0.30 hand sizes", events.first().displacement >= 0.30f)
+    }
+
+    @Test
+    fun idleJitterSequence1s_emitsNothing() {
+        // A 1.0 s idle jitter sequence (+-0.02 hand-size noise) emits nothing
+        val events = mutableListOf<SwipeEvent>()
+        val handSize = 0.20f
+        val baseX = 0.50f
+        val baseY = 0.50f
+        val totalDurationMs = 1000L
+        val dt = 40L
+        val frames = (totalDurationMs / dt).toInt()
+
+        // Deterministic noise sequence within [-0.02, 0.02] hand sizes
+        val noisePattern = listOf(-0.018f, 0.015f, -0.005f, 0.019f, -0.012f, 0.008f, -0.020f, 0.011f)
+        var t = 0L
+
+        for (i in 0..frames) {
+            val noiseHand = noisePattern[i % noisePattern.size]
+            val x = baseX
+            val y = baseY + noiseHand * handSize
+            detector.onFrame(t, createSyntheticHand(x, y, handSize))?.let { events.add(it) }
+            t += dt
+        }
+
+        assertTrue("1.0 s idle jitter sequence must emit nothing", events.isEmpty())
     }
 }

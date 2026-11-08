@@ -6,15 +6,15 @@ package com.delata.nohands.gesture
  */
 data class MotionConfig(
     val windowMs: Long = 300L,
-    val minDisplacementHands: Float = 1.0f,
-    val minPeakSpeedHandsPerSec: Float = 3.5f,
+    val minDisplacementHands: Float = 0.30f,
+    val minPeakSpeedHandsPerSec: Float = 2.5f,
     val maxDurationMs: Long = 400L,
     val minDurationMs: Long = 80L,
-    val verticalDominance: Float = 2.0f,
+    val verticalDominance: Float = 1.5f,
     val cooldownMs: Long = 700L,
-    val settleSpeedHandsPerSec: Float = 0.8f,
-    val settleMs: Long = 200L,
-    val handLostGraceMs: Long = 250L,
-    val minConsecutiveFrames: Int = 3,
+    val settleSpeedHandsPerSec: Float = 1.2f,
+    val settleMs: Long = 150L,
+    val handLostGraceMs: Long = 400L,
+    val minConsecutiveFrames: Int = 2,
     val emaAlpha: Float = 0.5f
 )
