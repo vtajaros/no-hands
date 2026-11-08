@@ -1,6 +1,7 @@
 package com.delata.nohands.camera
 
 import android.content.Context
+import android.util.Log
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -16,6 +17,10 @@ import kotlin.coroutines.suspendCoroutine
  */
 class CameraManager {
 
+    companion object {
+        private const val TAG = "NoHands"
+    }
+
     /**
      * Asynchronously retrieves the ProcessCameraProvider instance.
      */
@@ -25,8 +30,11 @@ class CameraManager {
             cameraProviderFuture.addListener(
                 {
                     try {
-                        continuation.resume(cameraProviderFuture.get())
+                        val provider = cameraProviderFuture.get()
+                        Log.d(TAG, "provider ready")
+                        continuation.resume(provider)
                     } catch (e: Exception) {
+                        Log.d(TAG, "onError: ${e.message}")
                         continuation.resumeWithException(e)
                     }
                 },
@@ -40,7 +48,8 @@ class CameraManager {
     fun hasFrontCamera(provider: ProcessCameraProvider): Boolean {
         return try {
             provider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.d(TAG, "onError: ${e.message}")
             false
         }
     }
@@ -56,8 +65,12 @@ class CameraManager {
         onError: (Throwable) -> Unit
     ) {
         try {
+            Log.d(TAG, "bind start")
+
             if (!hasFrontCamera(provider)) {
-                onError(IllegalStateException("Front camera is not available on this device."))
+                val error = IllegalStateException("Front camera is not available on this device.")
+                Log.d(TAG, "onError: ${error.message}")
+                onError(error)
                 return
             }
 
@@ -65,13 +78,14 @@ class CameraManager {
                 it.surfaceProvider = previewView.surfaceProvider
             }
 
-            provider.unbindAll()
             provider.bindToLifecycle(
                 lifecycleOwner,
                 CameraSelector.DEFAULT_FRONT_CAMERA,
                 preview
             )
+            Log.d(TAG, "bind success")
         } catch (e: Exception) {
+            Log.d(TAG, "onError: ${e.message}")
             onError(e)
         }
     }
@@ -82,8 +96,8 @@ class CameraManager {
     fun unbindAll(provider: ProcessCameraProvider) {
         try {
             provider.unbindAll()
-        } catch (_: Exception) {
-            // Ignore unbind errors during teardown
+        } catch (e: Exception) {
+            Log.d(TAG, "onError: ${e.message}")
         }
     }
 }

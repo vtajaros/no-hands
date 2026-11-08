@@ -7,6 +7,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
+import android.util.Log
+import android.view.ViewGroup
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -144,6 +146,7 @@ fun HomeScreen(
                 CameraPreviewView(
                     cameraManager = cameraManager,
                     onError = { error ->
+                        Log.d("NoHands", "onError: $error")
                         cameraError = error
                     }
                 )
@@ -167,24 +170,45 @@ fun CameraPreviewView(
     var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
     var isInitializing by remember { mutableStateOf(true) }
 
+    val previewView = remember {
+        PreviewView(context).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+        }
+    }
+
     LaunchedEffect(Unit) {
         try {
             val provider = cameraManager.getCameraProvider(context)
             if (!cameraManager.hasFrontCamera(provider)) {
-                onError("Front camera is not available on this device.")
+                val msg = "Front camera is not available on this device."
+                Log.d("NoHands", "onError: $msg")
+                onError(msg)
             } else {
                 cameraProvider = provider
             }
         } catch (e: Exception) {
-            onError(e.localizedMessage ?: "Failed to initialize camera provider.")
+            val msg = e.localizedMessage ?: "Failed to initialize camera provider."
+            Log.d("NoHands", "onError: $msg")
+            onError(msg)
         } finally {
             isInitializing = false
         }
     }
 
-    DisposableEffect(lifecycleOwner, cameraProvider) {
-        onDispose {
-            cameraProvider?.let { cameraManager.unbindAll(it) }
+    val provider = cameraProvider
+    if (provider != null) {
+        LaunchedEffect(provider, lifecycleOwner, previewView) {
+            cameraManager.bindPreview(
+                provider = provider,
+                lifecycleOwner = lifecycleOwner,
+                previewView = previewView,
+                onError = { throwable ->
+                    val msg = throwable.localizedMessage ?: "Failed to bind camera preview."
+                    Log.d("NoHands", "onError: $msg")
+                    onError(msg)
+                }
+            )
         }
     }
 
@@ -196,27 +220,13 @@ fun CameraPreviewView(
             CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
         }
     } else {
-        cameraProvider?.let { provider ->
-            AndroidView(
-                factory = { ctx ->
-                    PreviewView(ctx).apply {
-                        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                        scaleType = PreviewView.ScaleType.FILL_CENTER
-                    }
-                },
-                modifier = modifier.fillMaxSize(),
-                update = { previewView ->
-                    cameraManager.bindPreview(
-                        provider = provider,
-                        lifecycleOwner = lifecycleOwner,
-                        previewView = previewView,
-                        onError = { throwable ->
-                            onError(throwable.localizedMessage ?: "Failed to bind camera preview.")
-                        }
-                    )
-                }
-            )
-        }
+        AndroidView(
+            factory = {
+                (previewView.parent as? ViewGroup)?.removeView(previewView)
+                previewView
+            },
+            modifier = modifier.fillMaxSize()
+        )
     }
 }
 
