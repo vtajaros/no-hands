@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.os.SystemClock
 import android.util.Log
+import com.delata.nohands.gesture.GestureStateHolder
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -22,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap
 class HandLandmarkerHelper(
     private val context: Context,
     private val trackingStateHolder: TrackingStateHolder,
+    private val gestureStateHolder: GestureStateHolder,
     val delegate: Delegate = Delegate.CPU
 ) {
     companion object {
@@ -98,6 +100,7 @@ class HandLandmarkerHelper(
                             landmarks = emptyList(),
                             inferenceTimeMs = 0L
                         )
+                        gestureStateHolder.onFrame(SystemClock.uptimeMillis(), null)
                     }
                 }
                 .build()
@@ -173,6 +176,7 @@ class HandLandmarkerHelper(
                         landmarks = emptyList(),
                         inferenceTimeMs = 0L
                     )
+                    gestureStateHolder.onFrame(timestampMs, null)
                 }
             }
         }
@@ -226,6 +230,12 @@ class HandLandmarkerHelper(
             isHandPresent = isHandPresent,
             landmarks = normalizedPoints,
             inferenceTimeMs = inferenceTimeMs
+        )
+
+        // Feed landmarks into motion detector on the analyzer/result thread
+        gestureStateHolder.onFrame(
+            timestampMs = timestampMs,
+            landmarks = if (isHandPresent) normalizedPoints else null
         )
 
         // Once per second, log required diagnostic metrics

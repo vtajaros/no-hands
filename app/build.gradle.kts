@@ -58,4 +58,7 @@ dependencies {
 
     // MediaPipe
     implementation(libs.mediapipe.tasks.vision)
+
+    // Unit testing
+    testImplementation(libs.junit)
 }

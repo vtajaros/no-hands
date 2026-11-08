@@ -16,6 +16,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -60,11 +64,16 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.delata.nohands.camera.CameraAnalyzer
 import com.delata.nohands.camera.CameraManager
+import com.delata.nohands.gesture.GestureDebug
+import com.delata.nohands.gesture.GestureStateHolder
+import com.delata.nohands.gesture.SwipeDirection
 import com.delata.nohands.vision.HandLandmarkerHelper
 import com.delata.nohands.vision.HandOverlay
 import com.delata.nohands.vision.TrackingState
 import com.delata.nohands.vision.TrackingStateHolder
 import com.google.mediapipe.tasks.core.Delegate
+import kotlinx.coroutines.delay
+import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -211,6 +220,7 @@ fun CameraPreviewView(
     }
 
     val trackingStateHolder = remember { TrackingStateHolder() }
+    val gestureStateHolder = remember { GestureStateHolder() }
 
     // Helper state holder allowing dynamic delegate switching
     val helperState = remember { mutableStateOf<HandLandmarkerHelper?>(null) }
@@ -220,6 +230,22 @@ fun CameraPreviewView(
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val screenDisposedRef = remember { AtomicBoolean(false) }
 
+    // Gesture feedback and swipe counter state
+    var lastSwipeText by remember { mutableStateOf<String?>(null) }
+    var swipeCount by remember { mutableStateOf(0) }
+    var showSwipeFeedback by remember { mutableStateOf(false) }
+
+    // Listen for swipe events to show on-screen feedback for 600 ms
+    LaunchedEffect(gestureStateHolder.swipeEvents) {
+        gestureStateHolder.swipeEvents.collect { event ->
+            swipeCount++
+            lastSwipeText = if (event.direction == SwipeDirection.UP) "NEXT ▲" else "PREV ▼"
+            showSwipeFeedback = true
+            delay(600)
+            showSwipeFeedback = false
+        }
+    }
+
     // Initial helper creation on helperLifecycleExecutor (default: GPU)
     LaunchedEffect(Unit) {
         val startCreateTime = SystemClock.uptimeMillis()
@@ -227,6 +253,7 @@ fun CameraPreviewView(
             val (helper, label, finalDelegate) = createHelperWithFallback(
                 context = context,
                 trackingStateHolder = trackingStateHolder,
+                gestureStateHolder = gestureStateHolder,
                 targetDelegate = Delegate.GPU
             )
 
@@ -264,13 +291,14 @@ fun CameraPreviewView(
         delegateLabel = "Switching..."
         analyzer.setHelper(null)
 
-        // Clear overlay/FPS state
+        // Clear overlay/FPS state and reset gesture detector
         trackingStateHolder.updateFps(0)
         trackingStateHolder.updateResults(
             isHandPresent = false,
             landmarks = emptyList(),
             inferenceTimeMs = 0L
         )
+        gestureStateHolder.reset()
 
         val targetDelegate = if (activeDelegate == Delegate.CPU) Delegate.GPU else Delegate.CPU
         val oldHelper = activeHelperHolder.get()
@@ -281,6 +309,7 @@ fun CameraPreviewView(
             val (newHelper, label, finalDelegate) = createHelperWithFallback(
                 context = context,
                 trackingStateHolder = trackingStateHolder,
+                gestureStateHolder = gestureStateHolder,
                 targetDelegate = targetDelegate
             )
 
@@ -378,6 +407,7 @@ fun CameraPreviewView(
         }
     } else {
         val trackingState by trackingStateHolder.state.collectAsState()
+        val gestureDebug by gestureStateHolder.debugState.collectAsState()
 
         Box(modifier = modifier.fillMaxSize()) {
             AndroidView(
@@ -413,14 +443,45 @@ fun CameraPreviewView(
                     }
             )
 
-            // Minimal non-blocking HUD with delegate toggle
+            // Large centered label for swipe feedback (600 ms display with short fade)
+            AnimatedVisibility(
+                visible = showSwipeFeedback,
+                enter = fadeIn(animationSpec = tween(100)),
+                exit = fadeOut(animationSpec = tween(200)),
+                modifier = Modifier.align(Alignment.Center)
+            ) {
+                lastSwipeText?.let { text ->
+                    Surface(
+                        shape = RoundedCornerShape(24.dp),
+                        color = MaterialTheme.colorScheme.inverseSurface.copy(alpha = 0.85f),
+                        shadowElevation = 8.dp,
+                        modifier = Modifier.padding(24.dp)
+                    ) {
+                        Text(
+                            text = text,
+                            style = MaterialTheme.typography.displayMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.inverseOnSurface,
+                            modifier = Modifier.padding(horizontal = 32.dp, vertical = 20.dp)
+                        )
+                    }
+                }
+            }
+
+            // Minimal non-blocking HUD with delegate toggle and gesture metrics
             TrackingHud(
                 trackingState = trackingState,
+                gestureDebug = gestureDebug,
+                swipeCount = swipeCount,
                 delegateLabel = delegateLabel,
                 canToggleDelegate = isHelperReady && !isSwitching,
                 onToggleDelegate = onToggleDelegate,
                 onToggleTracking = {
-                    trackingStateHolder.setTrackingActive(!trackingState.isTrackingActive)
+                    val newActive = !trackingState.isTrackingActive
+                    trackingStateHolder.setTrackingActive(newActive)
+                    if (!newActive) {
+                        gestureStateHolder.reset()
+                    }
                 },
                 modifier = Modifier.fillMaxSize()
             )
@@ -435,19 +496,20 @@ fun CameraPreviewView(
 private fun createHelperWithFallback(
     context: Context,
     trackingStateHolder: TrackingStateHolder,
+    gestureStateHolder: GestureStateHolder,
     targetDelegate: Delegate
 ): Triple<HandLandmarkerHelper, String, Delegate> {
     return if (targetDelegate == Delegate.GPU) {
         try {
-            val helper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.GPU)
+            val helper = HandLandmarkerHelper(context, trackingStateHolder, gestureStateHolder, Delegate.GPU)
             Triple(helper, "GPU", Delegate.GPU)
         } catch (e: Exception) {
             Log.d("NoHands", "GPU delegate failed: ${e.message}")
-            val fallbackHelper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.CPU)
+            val fallbackHelper = HandLandmarkerHelper(context, trackingStateHolder, gestureStateHolder, Delegate.CPU)
             Triple(fallbackHelper, "CPU (GPU failed)", Delegate.CPU)
         }
     } else {
-        val helper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.CPU)
+        val helper = HandLandmarkerHelper(context, trackingStateHolder, gestureStateHolder, Delegate.CPU)
         Triple(helper, "CPU", Delegate.CPU)
     }
 }
@@ -459,6 +521,8 @@ private fun createHelperWithFallback(
 @Composable
 fun TrackingHud(
     trackingState: TrackingState,
+    gestureDebug: GestureDebug,
+    swipeCount: Int,
     delegateLabel: String,
     canToggleDelegate: Boolean,
     onToggleDelegate: () -> Unit,
@@ -476,71 +540,93 @@ fun TrackingHud(
             color = MaterialTheme.colorScheme.surface.copy(alpha = 0.75f),
             tonalElevation = 4.dp
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
             ) {
-                val statusText = if (!trackingState.isTrackingActive) {
-                    "Stopped"
-                } else if (trackingState.isHandPresent) {
-                    "Tracking"
-                } else {
-                    "Searching..."
-                }
-
-                val statusColor = if (!trackingState.isTrackingActive) {
-                    MaterialTheme.colorScheme.outline
-                } else if (trackingState.isHandPresent) {
-                    Color(0xFF00E676)
-                } else {
-                    Color(0xFFFFB300)
-                }
-
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = statusColor.copy(alpha = 0.2f),
-                    contentColor = statusColor
+                // Line 1: Status, Delegate, FPS, Inference, Swipes
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text(
-                        text = statusText,
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
-                }
-
-                // Interactive Delegate Chip ("Loading...", "Switching...", "GPU", "CPU", or "CPU (GPU failed)")
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = MaterialTheme.colorScheme.secondaryContainer.copy(
-                        alpha = if (canToggleDelegate) 0.85f else 0.4f
-                    ),
-                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-                    modifier = if (canToggleDelegate) {
-                        Modifier.clickable(onClick = onToggleDelegate)
+                    val statusText = if (!trackingState.isTrackingActive) {
+                        "Stopped"
+                    } else if (trackingState.isHandPresent) {
+                        "Tracking"
                     } else {
-                        Modifier
+                        "Searching..."
                     }
-                ) {
+
+                    val statusColor = if (!trackingState.isTrackingActive) {
+                        MaterialTheme.colorScheme.outline
+                    } else if (trackingState.isHandPresent) {
+                        Color(0xFF00E676)
+                    } else {
+                        Color(0xFFFFB300)
+                    }
+
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = statusColor.copy(alpha = 0.2f),
+                        contentColor = statusColor
+                    ) {
+                        Text(
+                            text = statusText,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+
+                    // Interactive Delegate Chip ("Loading...", "Switching...", "GPU", "CPU", or "CPU (GPU failed)")
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer.copy(
+                            alpha = if (canToggleDelegate) 0.85f else 0.4f
+                        ),
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = if (canToggleDelegate) {
+                            Modifier.clickable(onClick = onToggleDelegate)
+                        } else {
+                            Modifier
+                        }
+                    ) {
+                        Text(
+                            text = delegateLabel,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+
                     Text(
-                        text = delegateLabel,
+                        text = "FPS: ${trackingState.fps}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+
+                    Text(
+                        text = "Inference: ${trackingState.inferenceTimeMs} ms",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+
+                    Text(
+                        text = "Swipes: $swipeCount",
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        color = MaterialTheme.colorScheme.primary
                     )
                 }
 
+                // Line 2: Debug metrics (detector state, windowed dy in hand sizes (2 decimals), current speed)
+                Spacer(modifier = Modifier.height(4.dp))
+                val dyStr = String.format(Locale.US, "%.2f", gestureDebug.windowedDy)
+                val spdStr = String.format(Locale.US, "%.2f", gestureDebug.speed)
                 Text(
-                    text = "FPS: ${trackingState.fps}",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-
-                Text(
-                    text = "Inference: ${trackingState.inferenceTimeMs} ms",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurface
+                    text = "${gestureDebug.state.name} | dy: ${dyStr}h | spd: ${spdStr}h/s",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
