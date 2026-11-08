@@ -6,6 +6,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.ViewGroup
@@ -63,6 +66,8 @@ import com.delata.nohands.vision.TrackingState
 import com.delata.nohands.vision.TrackingStateHolder
 import com.google.mediapipe.tasks.core.Delegate
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Main application screen handling camera permission states, error states,
@@ -181,27 +186,85 @@ fun CameraPreviewView(
     var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
     var isInitializing by remember { mutableStateOf(true) }
 
-    // Active delegate state and chip label
-    var activeDelegate by remember { mutableStateOf(Delegate.CPU) }
-    var delegateLabel by remember { mutableStateOf("CPU") }
+    // Active delegate state and chip label (starts Loading... with GPU default)
+    var activeDelegate by remember { mutableStateOf(Delegate.GPU) }
+    var delegateLabel by remember { mutableStateOf("Loading...") }
+    var isHelperReady by remember { mutableStateOf(false) }
+    var isSwitching by remember { mutableStateOf(false) }
+
+    // Stored dimensions to populate newly created helpers immediately
+    var currentOverlaySizePx by remember { mutableStateOf("N/A") }
+    var currentPreviewSizePx by remember { mutableStateOf("N/A") }
+    var currentPreviewResolution by remember { mutableStateOf("N/A") }
 
     // Dedicated single-thread executor for image analysis
-    val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+    val analysisExecutor = remember {
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "Camera-Analysis")
+        }
+    }
+    // Dedicated single-thread executor for helper lifecycle work (create / close)
+    val helperLifecycleExecutor = remember {
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "HandLandmarker-Lifecycle")
+        }
+    }
+
     val trackingStateHolder = remember { TrackingStateHolder() }
 
-    // Helper holder allowing dynamic delegate switching
-    val helperState = remember {
-        mutableStateOf(HandLandmarkerHelper(context, trackingStateHolder, Delegate.CPU))
+    // Helper state holder allowing dynamic delegate switching
+    val helperState = remember { mutableStateOf<HandLandmarkerHelper?>(null) }
+    val activeHelperHolder = remember { AtomicReference<HandLandmarkerHelper?>(null) }
+    val analyzer = remember { CameraAnalyzer(null, trackingStateHolder) }
+
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val screenDisposedRef = remember { AtomicBoolean(false) }
+
+    // Initial helper creation on helperLifecycleExecutor (default: GPU)
+    LaunchedEffect(Unit) {
+        val startCreateTime = SystemClock.uptimeMillis()
+        helperLifecycleExecutor.execute {
+            val (helper, label, finalDelegate) = createHelperWithFallback(
+                context = context,
+                trackingStateHolder = trackingStateHolder,
+                targetDelegate = Delegate.GPU
+            )
+
+            mainHandler.post {
+                if (screenDisposedRef.get()) {
+                    try { helper.close() } catch (_: Exception) {}
+                    return@post
+                }
+
+                helper.overlaySizePx = currentOverlaySizePx
+                helper.previewViewSizePx = currentPreviewSizePx
+                helper.previewResolution = currentPreviewResolution
+
+                activeHelperHolder.set(helper)
+                helperState.value = helper
+                analyzer.setHelper(helper)
+                activeDelegate = finalDelegate
+                delegateLabel = label
+                isHelperReady = true
+
+                val tookMs = SystemClock.uptimeMillis() - startCreateTime
+                Log.d("NoHands", "initial helper ready total=${tookMs}ms delegate=${finalDelegate.name}")
+            }
+        }
     }
-    val analyzer = remember { CameraAnalyzer(helperState.value, trackingStateHolder) }
 
     // Delegate toggle callback
-    val onToggleDelegate: () -> Unit = {
-        val targetDelegate = if (activeDelegate == Delegate.CPU) Delegate.GPU else Delegate.CPU
-        val oldHelper = helperState.value
-        oldHelper.close()
+    val onToggleDelegate: () -> Unit = onToggleDelegate@{
+        if (!isHelperReady || isSwitching) {
+            return@onToggleDelegate
+        }
 
-        // Reset FPS and inference counters
+        val switchStartTime = SystemClock.uptimeMillis()
+        isSwitching = true
+        delegateLabel = "Switching..."
+        analyzer.setHelper(null)
+
+        // Clear overlay/FPS state
         trackingStateHolder.updateFps(0)
         trackingStateHolder.updateResults(
             isHandPresent = false,
@@ -209,44 +272,56 @@ fun CameraPreviewView(
             inferenceTimeMs = 0L
         )
 
-        if (targetDelegate == Delegate.GPU) {
-            try {
-                val newHelper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.GPU)
-                newHelper.overlaySizePx = oldHelper.overlaySizePx
-                newHelper.previewViewSizePx = oldHelper.previewViewSizePx
-                newHelper.previewResolution = oldHelper.previewResolution
+        val targetDelegate = if (activeDelegate == Delegate.CPU) Delegate.GPU else Delegate.CPU
+        val oldHelper = activeHelperHolder.get()
+
+        helperLifecycleExecutor.execute {
+            oldHelper?.close()
+
+            val (newHelper, label, finalDelegate) = createHelperWithFallback(
+                context = context,
+                trackingStateHolder = trackingStateHolder,
+                targetDelegate = targetDelegate
+            )
+
+            mainHandler.post {
+                if (screenDisposedRef.get()) {
+                    try { newHelper.close() } catch (_: Exception) {}
+                    return@post
+                }
+
+                newHelper.overlaySizePx = currentOverlaySizePx
+                newHelper.previewViewSizePx = currentPreviewSizePx
+                newHelper.previewResolution = currentPreviewResolution
+
+                activeHelperHolder.set(newHelper)
                 helperState.value = newHelper
                 analyzer.setHelper(newHelper)
-                activeDelegate = Delegate.GPU
-                delegateLabel = "GPU"
-            } catch (e: Exception) {
-                Log.d("NoHands", "GPU delegate failed: ${e.message}")
-                val fallbackHelper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.CPU)
-                fallbackHelper.overlaySizePx = oldHelper.overlaySizePx
-                fallbackHelper.previewViewSizePx = oldHelper.previewViewSizePx
-                fallbackHelper.previewResolution = oldHelper.previewResolution
-                helperState.value = fallbackHelper
-                analyzer.setHelper(fallbackHelper)
-                activeDelegate = Delegate.CPU
-                delegateLabel = "CPU (GPU failed)"
+                activeDelegate = finalDelegate
+                delegateLabel = label
+                isSwitching = false
+
+                val totalMs = SystemClock.uptimeMillis() - switchStartTime
+                Log.d("NoHands", "switch done total=${totalMs}ms")
             }
-        } else {
-            val newHelper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.CPU)
-            newHelper.overlaySizePx = oldHelper.overlaySizePx
-            newHelper.previewViewSizePx = oldHelper.previewViewSizePx
-            newHelper.previewResolution = oldHelper.previewResolution
-            helperState.value = newHelper
-            analyzer.setHelper(newHelper)
-            activeDelegate = Delegate.CPU
-            delegateLabel = "CPU"
         }
     }
 
     // Clean teardown capturing local vals (never delegated state)
-    DisposableEffect(analysisExecutor) {
+    val analysisExec = analysisExecutor
+    val lifecycleExec = helperLifecycleExecutor
+    val currentHelperHolder = activeHelperHolder
+    val isDisposed = screenDisposedRef
+
+    DisposableEffect(analysisExec, lifecycleExec) {
         onDispose {
-            analysisExecutor.shutdown()
-            helperState.value.close()
+            isDisposed.set(true)
+            val helperToClose = currentHelperHolder.getAndSet(null)
+            lifecycleExec.execute {
+                helperToClose?.close()
+            }
+            lifecycleExec.shutdown()
+            analysisExec.shutdown()
         }
     }
 
@@ -315,8 +390,12 @@ fun CameraPreviewView(
                     .onSizeChanged { size ->
                         val sizeStr = "${size.width}x${size.height}"
                         val resStr = getPreviewResolution(previewView)
-                        helperState.value.previewViewSizePx = sizeStr
-                        helperState.value.previewResolution = resStr
+                        currentPreviewSizePx = sizeStr
+                        currentPreviewResolution = resStr
+                        helperState.value?.let {
+                            it.previewViewSizePx = sizeStr
+                            it.previewResolution = resStr
+                        }
                     }
             )
 
@@ -326,7 +405,11 @@ fun CameraPreviewView(
                 modifier = Modifier
                     .fillMaxSize()
                     .onSizeChanged { size ->
-                        helperState.value.overlaySizePx = "${size.width}x${size.height}"
+                        val sizeStr = "${size.width}x${size.height}"
+                        currentOverlaySizePx = sizeStr
+                        helperState.value?.let {
+                            it.overlaySizePx = sizeStr
+                        }
                     }
             )
 
@@ -334,6 +417,7 @@ fun CameraPreviewView(
             TrackingHud(
                 trackingState = trackingState,
                 delegateLabel = delegateLabel,
+                canToggleDelegate = isHelperReady && !isSwitching,
                 onToggleDelegate = onToggleDelegate,
                 onToggleTracking = {
                     trackingStateHolder.setTrackingActive(!trackingState.isTrackingActive)
@@ -345,6 +429,30 @@ fun CameraPreviewView(
 }
 
 /**
+ * Safely creates HandLandmarkerHelper with the requested delegate.
+ * Falls back to CPU if GPU creation fails.
+ */
+private fun createHelperWithFallback(
+    context: Context,
+    trackingStateHolder: TrackingStateHolder,
+    targetDelegate: Delegate
+): Triple<HandLandmarkerHelper, String, Delegate> {
+    return if (targetDelegate == Delegate.GPU) {
+        try {
+            val helper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.GPU)
+            Triple(helper, "GPU", Delegate.GPU)
+        } catch (e: Exception) {
+            Log.d("NoHands", "GPU delegate failed: ${e.message}")
+            val fallbackHelper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.CPU)
+            Triple(fallbackHelper, "CPU (GPU failed)", Delegate.CPU)
+        }
+    } else {
+        val helper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.CPU)
+        Triple(helper, "CPU", Delegate.CPU)
+    }
+}
+
+/**
  * Minimal Material 3 HUD overlay.
  * Does not intercept touch events except on interactive chips and buttons.
  */
@@ -352,6 +460,7 @@ fun CameraPreviewView(
 fun TrackingHud(
     trackingState: TrackingState,
     delegateLabel: String,
+    canToggleDelegate: Boolean,
     onToggleDelegate: () -> Unit,
     onToggleTracking: () -> Unit,
     modifier: Modifier = Modifier
@@ -401,12 +510,18 @@ fun TrackingHud(
                     )
                 }
 
-                // Interactive Delegate Chip ("CPU", "GPU", or "CPU (GPU failed)")
+                // Interactive Delegate Chip ("Loading...", "Switching...", "GPU", "CPU", or "CPU (GPU failed)")
                 Surface(
                     shape = RoundedCornerShape(12.dp),
-                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.85f),
+                    color = MaterialTheme.colorScheme.secondaryContainer.copy(
+                        alpha = if (canToggleDelegate) 0.85f else 0.4f
+                    ),
                     contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-                    modifier = Modifier.clickable(onClick = onToggleDelegate)
+                    modifier = if (canToggleDelegate) {
+                        Modifier.clickable(onClick = onToggleDelegate)
+                    } else {
+                        Modifier
+                    }
                 ) {
                     Text(
                         text = delegateLabel,

@@ -29,8 +29,9 @@ class HandLandmarkerHelper(
         private const val MODEL_NAME = "hand_landmarker.task"
     }
 
+    private val closeLock = Any()
     private var handLandmarker: HandLandmarker? = null
-    private var isClosed = false
+    @Volatile private var isClosed = false
     private var hasLoggedFirstResult = false
     private val frameStartTimes = ConcurrentHashMap<Long, Long>()
     private val frameBitmaps = ConcurrentHashMap<Long, Bitmap>()
@@ -52,6 +53,11 @@ class HandLandmarkerHelper(
     }
 
     private fun setupHandLandmarker() {
+        val startTime = SystemClock.uptimeMillis()
+        Log.d(
+            TAG,
+            "helper create start delegate=${delegate.name} thread=${Thread.currentThread().name}"
+        )
         try {
             val baseOptions = BaseOptions.builder()
                 .setModelAssetPath(MODEL_NAME)
@@ -66,36 +72,56 @@ class HandLandmarkerHelper(
                 .setMinHandPresenceConfidence(0.5f)
                 .setMinTrackingConfidence(0.5f)
                 .setResultListener { result: HandLandmarkerResult, input: MPImage ->
-                    handleResult(result)
                     try {
-                        input.close()
-                    } catch (_: Exception) {}
+                        if (!isClosed) {
+                            handleResult(result)
+                        } else {
+                            val timestampMs = result.timestampMs()
+                            frameStartTimes.remove(timestampMs)
+                            frameBitmaps.remove(timestampMs)?.let { bm ->
+                                try {
+                                    if (!bm.isRecycled) bm.recycle()
+                                } catch (_: Exception) {}
+                            }
+                        }
+                    } finally {
+                        try {
+                            input.close()
+                        } catch (_: Exception) {}
+                    }
                 }
                 .setErrorListener { error: RuntimeException ->
-                    Log.d(TAG, "onError: HandLandmarker runtime error: ${error.message}")
-                    trackingStateHolder.updateResults(
-                        isHandPresent = false,
-                        landmarks = emptyList(),
-                        inferenceTimeMs = 0L
-                    )
+                    if (!isClosed) {
+                        Log.d(TAG, "onError: HandLandmarker runtime error: ${error.message}")
+                        trackingStateHolder.updateResults(
+                            isHandPresent = false,
+                            landmarks = emptyList(),
+                            inferenceTimeMs = 0L
+                        )
+                    }
                 }
                 .build()
 
             handLandmarker = HandLandmarker.createFromOptions(context, options)
-            Log.d(TAG, "landmarker created (delegate=${delegate.name})")
+            val tookMs = SystemClock.uptimeMillis() - startTime
+            Log.d(
+                TAG,
+                "helper create done delegate=${delegate.name} thread=${Thread.currentThread().name} took=${tookMs}ms"
+            )
         } catch (e: Exception) {
+            val tookMs = SystemClock.uptimeMillis() - startTime
             if (delegate == Delegate.GPU) {
                 // Rethrow so caller can catch, log "GPU delegate failed: <message>", and fall back to CPU
                 throw e
             } else {
-                Log.d(TAG, "onError: Failed to create HandLandmarker: ${e.message}")
+                Log.d(TAG, "onError: Failed to create HandLandmarker (took=${tookMs}ms): ${e.message}")
             }
         }
     }
 
     /**
      * Submits an already-rotated, upright, mirrored bitmap to MediaPipe asynchronously
-     * without ImageProcessingOptions.
+     * without ImageProcessingOptions. Safe against concurrent or post-close calls.
      */
     fun detectAsync(
         bitmap: Bitmap,
@@ -104,43 +130,56 @@ class HandLandmarkerHelper(
         timestampMs: Long,
         framesAnalyzed: Long
     ) {
-        if (isClosed) {
-            bitmap.recycle()
-            return
-        }
+        synchronized(closeLock) {
+            if (isClosed) {
+                try {
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                } catch (_: Exception) {}
+                return
+            }
 
-        val landmarker = handLandmarker
-        if (landmarker == null) {
-            bitmap.recycle()
-            return
-        }
+            val landmarker = handLandmarker
+            if (landmarker == null) {
+                try {
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                } catch (_: Exception) {}
+                return
+            }
 
-        latestRotationDegrees = rotationDegrees
-        latestRotatedWidth = bitmap.width
-        latestRotatedHeight = bitmap.height
-        latestAnalysisRes = analysisRes
-        latestFramesAnalyzed = framesAnalyzed
+            latestRotationDegrees = rotationDegrees
+            latestRotatedWidth = bitmap.width
+            latestRotatedHeight = bitmap.height
+            latestAnalysisRes = analysisRes
+            latestFramesAnalyzed = framesAnalyzed
 
-        try {
-            frameStartTimes[timestampMs] = SystemClock.uptimeMillis()
-            frameBitmaps[timestampMs] = bitmap
+            try {
+                frameStartTimes[timestampMs] = SystemClock.uptimeMillis()
+                frameBitmaps[timestampMs] = bitmap
 
-            val mpImage = BitmapImageBuilder(bitmap).build()
-            // Detect asynchronously WITHOUT ImageProcessingOptions
-            landmarker.detectAsync(mpImage, timestampMs)
-        } catch (e: Exception) {
-            frameStartTimes.remove(timestampMs)
-            frameBitmaps.remove(timestampMs)?.recycle()
-            Log.d(TAG, "onError: Error in detectAsync: ${e.message}")
-            trackingStateHolder.updateResults(
-                isHandPresent = false,
-                landmarks = emptyList(),
-                inferenceTimeMs = 0L
-            )
+                val mpImage = BitmapImageBuilder(bitmap).build()
+                // Detect asynchronously WITHOUT ImageProcessingOptions
+                landmarker.detectAsync(mpImage, timestampMs)
+            } catch (e: Exception) {
+                frameStartTimes.remove(timestampMs)
+                frameBitmaps.remove(timestampMs)?.let { bm ->
+                    try {
+                        if (!bm.isRecycled) bm.recycle()
+                    } catch (_: Exception) {}
+                }
+                if (!isClosed) {
+                    Log.d(TAG, "onError: Error in detectAsync: ${e.message}")
+                    trackingStateHolder.updateResults(
+                        isHandPresent = false,
+                        landmarks = emptyList(),
+                        inferenceTimeMs = 0L
+                    )
+                }
+            }
         }
     }
 
     private fun handleResult(result: HandLandmarkerResult) {
+        if (isClosed) return
         val timestampMs = result.timestampMs()
         val startTime = frameStartTimes.remove(timestampMs)
         val inferenceTimeMs = if (startTime != null) {
@@ -150,7 +189,13 @@ class HandLandmarkerHelper(
         }
 
         // Recycle the transformed bitmap now that MediaPipe has finished with it
-        frameBitmaps.remove(timestampMs)?.recycle()
+        frameBitmaps.remove(timestampMs)?.let { bm ->
+            try {
+                if (!bm.isRecycled) bm.recycle()
+            } catch (_: Exception) {}
+        }
+
+        if (isClosed) return
 
         // Calculate result FPS (results per second) over rolling 1-second window
         val now = SystemClock.uptimeMillis()
@@ -198,21 +243,35 @@ class HandLandmarkerHelper(
         }
     }
 
+    /**
+     * Safely and idempotently closes the landmarker and cleans up all pending frames.
+     */
     fun close() {
-        isClosed = true
+        val landmarkerToClose: HandLandmarker?
+        synchronized(closeLock) {
+            if (isClosed) {
+                return
+            }
+            isClosed = true
+            landmarkerToClose = handLandmarker
+            handLandmarker = null
+        }
+
         frameStartTimes.clear()
-        for (bitmap in frameBitmaps.values) {
+        val bitmaps = frameBitmaps.values.toList()
+        frameBitmaps.clear()
+        for (bitmap in bitmaps) {
             try {
-                bitmap.recycle()
+                if (!bitmap.isRecycled) {
+                    bitmap.recycle()
+                }
             } catch (_: Exception) {}
         }
-        frameBitmaps.clear()
+
         try {
-            handLandmarker?.close()
+            landmarkerToClose?.close()
         } catch (e: Exception) {
             Log.d(TAG, "onError: Error closing HandLandmarker: ${e.message}")
-        } finally {
-            handLandmarker = null
         }
     }
 }
