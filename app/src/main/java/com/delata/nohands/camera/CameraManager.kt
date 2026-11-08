@@ -2,18 +2,23 @@ package com.delata.nohands.camera
 
 import android.content.Context
 import android.util.Log
+import android.util.Size
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import java.util.concurrent.Executor
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 
 /**
- * Manages CameraX initialization, device checks, and lifecycle-bound preview.
+ * Manages CameraX initialization, device checks, and lifecycle-bound preview and analysis.
  */
 class CameraManager {
 
@@ -55,13 +60,14 @@ class CameraManager {
     }
 
     /**
-     * Binds the front camera preview to the specified LifecycleOwner and PreviewView.
-     * Reports errors via the onError callback rather than throwing uncaught exceptions.
+     * Binds the front camera Preview and ImageAnalysis together in a single bindToLifecycle call.
      */
     fun bindPreview(
         provider: ProcessCameraProvider,
         lifecycleOwner: LifecycleOwner,
         previewView: PreviewView,
+        analyzer: ImageAnalysis.Analyzer,
+        executor: Executor,
         onError: (Throwable) -> Unit
     ) {
         try {
@@ -78,10 +84,28 @@ class CameraManager {
                 it.surfaceProvider = previewView.surfaceProvider
             }
 
+            val resolutionSelector = ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        Size(480, 360),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                    )
+                )
+                .build()
+
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .setResolutionSelector(resolutionSelector)
+                .build()
+
+            imageAnalysis.setAnalyzer(executor, analyzer)
+
             provider.bindToLifecycle(
                 lifecycleOwner,
                 CameraSelector.DEFAULT_FRONT_CAMERA,
-                preview
+                preview,
+                imageAnalysis
             )
             Log.d(TAG, "bind success")
         } catch (e: Exception) {

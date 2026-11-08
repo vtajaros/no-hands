@@ -13,16 +13,17 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -33,6 +34,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,18 +47,23 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.delata.nohands.camera.CameraAnalyzer
 import com.delata.nohands.camera.CameraManager
+import com.delata.nohands.vision.HandLandmarkerHelper
+import com.delata.nohands.vision.HandOverlay
+import com.delata.nohands.vision.TrackingState
+import com.delata.nohands.vision.TrackingStateHolder
+import java.util.concurrent.Executors
 
 /**
  * Main application screen handling camera permission states, error states,
- * and hosting the full-screen front camera preview.
+ * hosting the front camera preview, hand tracking overlay, and minimal HUD.
  */
 @Composable
 fun HomeScreen(
@@ -156,7 +163,8 @@ fun HomeScreen(
 }
 
 /**
- * Full-screen CameraX front preview hosted in an AndroidView.
+ * CameraX front preview hosted in an AndroidView, with MediaPipe hand tracking,
+ * landmark skeleton overlay, and minimal HUD.
  */
 @Composable
 fun CameraPreviewView(
@@ -169,6 +177,22 @@ fun CameraPreviewView(
 
     var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
     var isInitializing by remember { mutableStateOf(true) }
+
+    // Dedicated single-thread executor for image analysis
+    val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+    val trackingStateHolder = remember { TrackingStateHolder() }
+    val helper = remember { HandLandmarkerHelper(context, trackingStateHolder) }
+    val analyzer = remember { CameraAnalyzer(helper, trackingStateHolder) }
+
+    // Clean teardown capturing local vals (never delegated state)
+    DisposableEffect(analysisExecutor, helper) {
+        val executorToShutdown = analysisExecutor
+        val helperToClose = helper
+        onDispose {
+            executorToShutdown.shutdown()
+            helperToClose.close()
+        }
+    }
 
     val previewView = remember {
         PreviewView(context).apply {
@@ -203,6 +227,8 @@ fun CameraPreviewView(
                 provider = provider,
                 lifecycleOwner = lifecycleOwner,
                 previewView = previewView,
+                analyzer = analyzer,
+                executor = analysisExecutor,
                 onError = { throwable ->
                     val msg = throwable.localizedMessage ?: "Failed to bind camera preview."
                     Log.d("NoHands", "onError: $msg")
@@ -220,13 +246,114 @@ fun CameraPreviewView(
             CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
         }
     } else {
-        AndroidView(
-            factory = {
-                (previewView.parent as? ViewGroup)?.removeView(previewView)
-                previewView
-            },
-            modifier = modifier.fillMaxSize()
-        )
+        val trackingState by trackingStateHolder.state.collectAsState()
+
+        Box(modifier = modifier.fillMaxSize()) {
+            AndroidView(
+                factory = {
+                    (previewView.parent as? ViewGroup)?.removeView(previewView)
+                    previewView
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+
+            // Landmark skeleton overlay
+            HandOverlay(
+                trackingState = trackingState,
+                modifier = Modifier.fillMaxSize()
+            )
+
+            // Minimal non-blocking HUD
+            TrackingHud(
+                trackingState = trackingState,
+                onToggleTracking = {
+                    trackingStateHolder.setTrackingActive(!trackingState.isTrackingActive)
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+/**
+ * Minimal Material 3 HUD overlay.
+ * Does not intercept touch events except on the Start/Stop button.
+ */
+@Composable
+fun TrackingHud(
+    trackingState: TrackingState,
+    onToggleTracking: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(modifier = modifier) {
+        // Top status and metrics bar
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(top = 16.dp, start = 16.dp, end = 16.dp),
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.75f),
+            tonalElevation = 4.dp
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+            ) {
+                val statusText = if (!trackingState.isTrackingActive) {
+                    "Stopped"
+                } else if (trackingState.isHandPresent) {
+                    "Tracking"
+                } else {
+                    "Searching..."
+                }
+
+                val statusColor = if (!trackingState.isTrackingActive) {
+                    MaterialTheme.colorScheme.outline
+                } else if (trackingState.isHandPresent) {
+                    Color(0xFF00E676)
+                } else {
+                    Color(0xFFFFB300)
+                }
+
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = statusColor.copy(alpha = 0.2f),
+                    contentColor = statusColor
+                ) {
+                    Text(
+                        text = statusText,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+
+                Text(
+                    text = "FPS: ${trackingState.fps}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+
+                Text(
+                    text = "Inference: ${trackingState.inferenceTimeMs} ms",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        }
+
+        // Bottom center Start/Stop control button
+        Button(
+            onClick = onToggleTracking,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(bottom = 32.dp)
+        ) {
+            Text(if (trackingState.isTrackingActive) "Stop" else "Start")
+        }
     }
 }
 

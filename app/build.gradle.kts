@@ -55,4 +55,7 @@ dependencies {
     implementation(libs.camera.camera2)
     implementation(libs.camera.lifecycle)
     implementation(libs.camera.view)
+
+    // MediaPipe
+    implementation(libs.mediapipe.tasks.vision)
 }
