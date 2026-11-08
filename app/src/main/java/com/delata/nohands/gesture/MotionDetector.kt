@@ -1,6 +1,7 @@
 package com.delata.nohands.gesture
 
 import com.delata.nohands.vision.NormalizedPoint
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.sqrt
@@ -35,7 +36,8 @@ data class GestureDebug(
  * Analyzes normalized hand landmarks across a temporal sliding window.
  */
 class MotionDetector(
-    private val config: MotionConfig = MotionConfig()
+    private val config: MotionConfig = MotionConfig(),
+    private val log: (String) -> Unit = {}
 ) {
     private data class Sample(
         val timestampMs: Long,
@@ -59,6 +61,20 @@ class MotionDetector(
     private var currentWindowedDy: Float = 0f
     private var currentSpeed: Float = 0f
 
+    // Diagnostic logging state
+    private var isHandTracked: Boolean = false
+    private var hasResetForCurrentLoss: Boolean = false
+    private var lastEvalLogTimestampMs: Long = 0L
+    private var lastSettlingLogTimestampMs: Long = 0L
+
+    // 1-second summary tracking
+    private var lastSummaryTimestampMs: Long = 0L
+    private var fedCountInSec: Int = 0
+    private var withHandCountInSec: Int = 0
+    private var maxAbsDyInSec: Float = 0f
+    private var maxPeakInSec: Float = 0f
+    private var handSizeSumInSec: Double = 0.0
+
     fun getDebugSnapshot(): GestureDebug {
         return GestureDebug(
             state = state,
@@ -73,10 +89,28 @@ class MotionDetector(
         consecutiveFrames = 0
         lastHandTimestampMs = null
         isFirstSampleOfHand = true
+        isHandTracked = false
+        hasResetForCurrentLoss = false
         cooldownStartTimestampMs = 0L
         settleStartTimestampMs = null
         currentWindowedDy = 0f
         currentSpeed = 0f
+        lastEvalLogTimestampMs = 0L
+        lastSettlingLogTimestampMs = 0L
+        lastSummaryTimestampMs = 0L
+        fedCountInSec = 0
+        withHandCountInSec = 0
+        maxAbsDyInSec = 0f
+        maxPeakInSec = 0f
+        handSizeSumInSec = 0.0
+    }
+
+    private fun transitionTo(newState: DetectorState, timestampMs: Long) {
+        if (state != newState) {
+            val oldState = state
+            state = newState
+            log("MOTION STATE $oldState->$newState t=$timestampMs")
+        }
     }
 
     /**
@@ -88,17 +122,35 @@ class MotionDetector(
      * @return A [SwipeEvent] if a swipe gesture was recognized on this frame, or null otherwise.
      */
     fun onFrame(timestampMs: Long, landmarks: List<NormalizedPoint>?): SwipeEvent? {
+        fedCountInSec++
+
         // Hand missing
         if (landmarks == null || landmarks.size < 18) {
+            if (isHandTracked) {
+                val frames = consecutiveFrames
+                isHandTracked = false
+                log("MOTION HAND LOST after $frames frames")
+            }
             handleHandLost(timestampMs)
+            checkSummaryLog(timestampMs)
             return null
         }
 
         // Check if hand was lost for longer than grace period before this frame
         val lastSeen = lastHandTimestampMs
-        if (lastSeen != null && (timestampMs - lastSeen > config.handLostGraceMs)) {
-            triggerHandLossReset()
+        if (lastSeen != null && !hasResetForCurrentLoss && (timestampMs - lastSeen > config.handLostGraceMs)) {
+            val gap = timestampMs - lastSeen
+            hasResetForCurrentLoss = true
+            log("MOTION RESET loss exceeded grace period (${gap}ms > ${config.handLostGraceMs}ms)")
+            triggerHandLossReset(timestampMs)
         }
+
+        if (!isHandTracked) {
+            isHandTracked = true
+            hasResetForCurrentLoss = false
+            log("MOTION HAND ACQUIRED")
+        }
+
         lastHandTimestampMs = timestampMs
         consecutiveFrames++
 
@@ -117,6 +169,10 @@ class MotionDetector(
         val dy09 = p9.y - p0.y
         val rawHandSize = sqrt(dx09 * dx09 + dy09 * dy09)
         val handSize = max(rawHandSize, 0.001f)
+
+        // Track stats for summary
+        withHandCountInSec++
+        handSizeSumInSec += handSize
 
         // Smooth palm center with EMA
         if (isFirstSampleOfHand) {
@@ -159,39 +215,59 @@ class MotionDetector(
 
         // Ignore samples until hand present for minConsecutiveFrames in a row
         if (consecutiveFrames < config.minConsecutiveFrames) {
+            checkSummaryLog(timestampMs)
             return null
         }
 
         // State machine handling: COOLDOWN -> SETTLING -> ARMED
         if (state == DetectorState.COOLDOWN) {
             if (timestampMs - cooldownStartTimestampMs >= config.cooldownMs) {
-                state = DetectorState.SETTLING
+                transitionTo(DetectorState.SETTLING, timestampMs)
                 settleStartTimestampMs = null
             } else {
+                checkSummaryLog(timestampMs)
                 return null
             }
         }
 
         if (state == DetectorState.SETTLING) {
+            val belowMs = if (settleStartTimestampMs != null) timestampMs - settleStartTimestampMs!! else 0L
+
+            // Log settling diagnostics every 500 ms
+            if (timestampMs - lastSettlingLogTimestampMs >= 500L) {
+                lastSettlingLogTimestampMs = timestampMs
+                log(
+                    String.format(
+                        Locale.US,
+                        "MOTION SETTLING speed=%.2f belowSettleForMs=%d",
+                        currentSpeed,
+                        belowMs
+                    )
+                )
+            }
+
             // Settle check: return to ARMED only when speed stays below settleSpeed for settleMs continuously
             if (currentSpeed < config.settleSpeedHandsPerSec) {
                 val settleStart = settleStartTimestampMs
                 if (settleStart == null) {
                     settleStartTimestampMs = timestampMs
                 } else if (timestampMs - settleStart >= config.settleMs) {
-                    state = DetectorState.ARMED
+                    transitionTo(DetectorState.ARMED, timestampMs)
                     settleStartTimestampMs = null
                     samples.clear()
+                    checkSummaryLog(timestampMs)
                     return null
                 }
             } else {
                 settleStartTimestampMs = null
             }
+            checkSummaryLog(timestampMs)
             return null
         }
 
         // State is ARMED
         if (samples.size < 2) {
+            checkSummaryLog(timestampMs)
             return null
         }
 
@@ -223,12 +299,45 @@ class MotionDetector(
         val absDy = abs(dy)
         val absDx = abs(dx)
 
-        // Evaluate all swipe conditions
-        if (absDy >= config.minDisplacementHands &&
-            absDy >= config.verticalDominance * absDx &&
-            duration in config.minDurationMs..config.maxDurationMs &&
-            peakSpeed >= config.minPeakSpeedHandsPerSec
-        ) {
+        // Track max values for 1-second summary
+        if (absDy > maxAbsDyInSec) maxAbsDyInSec = absDy
+        if (peakSpeed > maxPeakInSec) maxPeakInSec = peakSpeed
+
+        // Evaluate swipe conditions
+        val passDisp = absDy >= config.minDisplacementHands
+        val passVertical = absDy >= config.verticalDominance * absDx
+        val passDuration = duration in config.minDurationMs..config.maxDurationMs
+        val passSpeed = peakSpeed >= config.minPeakSpeedHandsPerSec
+
+        // Collect failed conditions
+        val fails = mutableListOf<String>()
+        if (!passDisp) fails.add("disp")
+        if (!passVertical) fails.add("vertical")
+        if (!passDuration) fails.add("duration")
+        if (!passSpeed) fails.add("speed")
+        val failsStr = if (fails.isEmpty()) "none" else fails.joinToString(",")
+
+        // Log evaluation if |dy| >= 0.25 hand sizes OR peak speed >= 1.5 hand sizes/s (at most once per 100 ms)
+        if (absDy >= 0.25f || peakSpeed >= 1.5f) {
+            if (timestampMs - lastEvalLogTimestampMs >= 100L) {
+                lastEvalLogTimestampMs = timestampMs
+                log(
+                    String.format(
+                        Locale.US,
+                        "MOTION EVAL dy=%.2f dx=%.2f dur=%d peak=%.2f handSize=%.3f fails=[%s]",
+                        dy,
+                        dx,
+                        duration,
+                        peakSpeed,
+                        handSize,
+                        failsStr
+                    )
+                )
+            }
+        }
+
+        // Trigger swipe event if all conditions pass
+        if (passDisp && passVertical && passDuration && passSpeed) {
             val direction = if (dy > 0f) SwipeDirection.UP else SwipeDirection.DOWN
             val event = SwipeEvent(
                 direction = direction,
@@ -237,28 +346,65 @@ class MotionDetector(
                 peakSpeed = peakSpeed,
                 durationMs = duration
             )
-            state = DetectorState.COOLDOWN
+            transitionTo(DetectorState.COOLDOWN, newest.timestampMs)
             cooldownStartTimestampMs = newest.timestampMs
+            checkSummaryLog(timestampMs)
             return event
         }
 
+        checkSummaryLog(timestampMs)
         return null
     }
 
     private fun handleHandLost(timestampMs: Long) {
         val lastSeen = lastHandTimestampMs
-        if (lastSeen != null && (timestampMs - lastSeen > config.handLostGraceMs)) {
-            triggerHandLossReset()
+        if (lastSeen != null && !hasResetForCurrentLoss && (timestampMs - lastSeen > config.handLostGraceMs)) {
+            val gap = timestampMs - lastSeen
+            hasResetForCurrentLoss = true
+            log("MOTION RESET loss exceeded grace period (${gap}ms > ${config.handLostGraceMs}ms)")
+            triggerHandLossReset(timestampMs)
         }
     }
 
-    private fun triggerHandLossReset() {
+    private fun triggerHandLossReset(timestampMs: Long) {
         samples.clear()
         consecutiveFrames = 0
         isFirstSampleOfHand = true
-        state = DetectorState.SETTLING
+        transitionTo(DetectorState.SETTLING, timestampMs)
         settleStartTimestampMs = null
         currentWindowedDy = 0f
         currentSpeed = 0f
+    }
+
+    private fun checkSummaryLog(timestampMs: Long) {
+        if (lastSummaryTimestampMs == 0L) {
+            lastSummaryTimestampMs = timestampMs
+            return
+        }
+        if (timestampMs - lastSummaryTimestampMs >= 1000L) {
+            val avgHandSize = if (withHandCountInSec > 0) {
+                (handSizeSumInSec / withHandCountInSec).toFloat()
+            } else {
+                0f
+            }
+            log(
+                String.format(
+                    Locale.US,
+                    "MOTION SUMMARY fed=%d withHand=%d state=%s maxAbsDy=%.2f maxPeak=%.2f handSize=%.3f",
+                    fedCountInSec,
+                    withHandCountInSec,
+                    state.name,
+                    maxAbsDyInSec,
+                    maxPeakInSec,
+                    avgHandSize
+                )
+            )
+            lastSummaryTimestampMs = timestampMs
+            fedCountInSec = 0
+            withHandCountInSec = 0
+            maxAbsDyInSec = 0f
+            maxPeakInSec = 0f
+            handSizeSumInSec = 0.0
+        }
     }
 }

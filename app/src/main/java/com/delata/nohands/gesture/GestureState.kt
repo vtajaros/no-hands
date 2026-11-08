@@ -15,7 +15,9 @@ import java.util.Locale
  * and a SharedFlow of emitted swipe events for consumption by UI and future services.
  */
 class GestureStateHolder(
-    private val detector: MotionDetector = MotionDetector()
+    private val detector: MotionDetector = MotionDetector(
+        log = { Log.d(TAG, it) }
+    )
 ) {
     companion object {
         private const val TAG = "NoHands"

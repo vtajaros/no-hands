@@ -240,4 +240,134 @@ class MotionDetectorTest {
         assertTrue("No swipe should be triggered across disappearance gap", events.isEmpty())
         assertEquals("Detector must require settling after hand loss", DetectorState.SETTLING, detector.getDebugSnapshot().state)
     }
+
+    @Test
+    fun logging_capturesStateTransitionsAndEvals() {
+        val logs = mutableListOf<String>()
+        val loggedDetector = MotionDetector(log = { logs.add(it) })
+        val startY = 0.60f
+        val endY = 0.30f
+        var t = 0L
+
+        // Hand acquired
+        for (i in 0 until 3) {
+            loggedDetector.onFrame(t, createSyntheticHand(0.5f, startY))
+            t += 40L
+        }
+        assertTrue("Should log hand acquired", logs.any { it == "MOTION HAND ACQUIRED" })
+
+        // Upward flick triggering eval and state transition to COOLDOWN
+        for (i in 1..5) {
+            val y = startY - (startY - endY) * (i.toFloat() / 5)
+            loggedDetector.onFrame(t, createSyntheticHand(0.5f, y))
+            t += 40L
+        }
+
+        assertTrue(
+            "Should log MOTION EVAL",
+            logs.any { it.startsWith("MOTION EVAL") }
+        )
+        assertTrue(
+            "Should log state transition to COOLDOWN",
+            logs.any { it.startsWith("MOTION STATE ARMED->COOLDOWN") }
+        )
+
+        // Advance through cooldown (700 ms) and settling
+        while (t <= 1400L) {
+            loggedDetector.onFrame(t, createSyntheticHand(0.5f, endY))
+            t += 40L
+        }
+
+        assertTrue(
+            "Should log state transition to SETTLING",
+            logs.any { it.startsWith("MOTION STATE COOLDOWN->SETTLING") }
+        )
+        assertTrue(
+            "Should log state transition back to ARMED",
+            logs.any { it.startsWith("MOTION STATE SETTLING->ARMED") }
+        )
+        assertTrue(
+            "Should log periodic summary",
+            logs.any { it.startsWith("MOTION SUMMARY") }
+        )
+    }
+
+    @Test
+    fun logging_capturesHandLostAndGracePeriodReset() {
+        val logs = mutableListOf<String>()
+        val loggedDetector = MotionDetector(log = { logs.add(it) })
+        var t = 0L
+
+        // Feed 4 frames with hand
+        for (i in 0 until 4) {
+            loggedDetector.onFrame(t, createSyntheticHand(0.5f, 0.5f))
+            t += 40L
+        }
+
+        // Hand lost on next frame
+        loggedDetector.onFrame(t, null)
+        t += 40L
+        assertTrue(
+            "Should log hand lost after 4 frames",
+            logs.any { it == "MOTION HAND LOST after 4 frames" }
+        )
+
+        // Hand missing for > 250 ms (e.g. 7 frames = 280 ms)
+        for (i in 0 until 7) {
+            loggedDetector.onFrame(t, null)
+            t += 40L
+        }
+
+        assertTrue(
+            "Should log reset when grace period exceeded",
+            logs.any { it.startsWith("MOTION RESET loss exceeded grace period") }
+        )
+    }
+
+    @Test
+    fun logging_capturesFailsListAndSettlingLogs() {
+        val logs = mutableListOf<String>()
+        val loggedDetector = MotionDetector(log = { logs.add(it) })
+        val startY = 0.60f
+        var t = 0L
+
+        // Stabilize
+        for (i in 0 until 3) {
+            loggedDetector.onFrame(t, createSyntheticHand(0.5f, startY))
+            t += 40L
+        }
+
+        // Moderate drift (dy = 0.12 normalized = 0.6 hand sizes, smoothed to >= 0.25 hand sizes)
+        for (i in 1..2) {
+            t += 40L
+            loggedDetector.onFrame(t, createSyntheticHand(0.5f, startY - 0.06f * i))
+        }
+
+        val evalLog = logs.find { it.startsWith("MOTION EVAL") }
+        assertTrue("Expected MOTION EVAL log", evalLog != null)
+        assertTrue("Expected fails=[...] in log", evalLog!!.contains("fails=["))
+
+        // Trigger swipe to enter COOLDOWN
+        t = 400L
+        for (i in 1..5) {
+            val y = startY - (0.30f) * (i.toFloat() / 5)
+            loggedDetector.onFrame(t, createSyntheticHand(0.5f, y))
+            t += 40L
+        }
+
+        // Cooldown expires at t = 600 + 700 = 1300 ms, then enter SETTLING
+        // Move slightly to keep speed > settleSpeed (so it stays in SETTLING)
+        t = 1300L
+        for (i in 0 until 20) { // 800 ms in settling
+            // Speed = 0.01 / 0.2 / 0.04 = 1.25 hand sizes/s (> 0.8 settleSpeed)
+            val y = 0.30f + if (i % 2 == 0) 0.01f else -0.01f
+            loggedDetector.onFrame(t, createSyntheticHand(0.5f, y))
+            t += 40L
+        }
+
+        assertTrue(
+            "Expected MOTION SETTLING log while settling",
+            logs.any { it.startsWith("MOTION SETTLING speed=") }
+        )
+    }
 }
