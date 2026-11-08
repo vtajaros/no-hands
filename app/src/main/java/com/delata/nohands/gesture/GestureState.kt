@@ -32,8 +32,12 @@ class GestureStateHolder(
     /**
      * Processes landmark results from the analyzer thread.
      */
-    fun onFrame(timestampMs: Long, landmarks: List<NormalizedPoint>?) {
-        val event = detector.onFrame(timestampMs, landmarks)
+    fun onFrame(
+        timestampMs: Long,
+        landmarks: List<NormalizedPoint>?,
+        aspect: Float = 0.75f
+    ) {
+        val event = detector.onFrame(timestampMs, landmarks, aspect)
         _debugState.value = detector.getDebugSnapshot()
 
         if (event != null) {
