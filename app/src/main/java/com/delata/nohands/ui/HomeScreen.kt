@@ -13,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -43,6 +44,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -59,6 +61,7 @@ import com.delata.nohands.vision.HandLandmarkerHelper
 import com.delata.nohands.vision.HandOverlay
 import com.delata.nohands.vision.TrackingState
 import com.delata.nohands.vision.TrackingStateHolder
+import com.google.mediapipe.tasks.core.Delegate
 import java.util.concurrent.Executors
 
 /**
@@ -178,19 +181,72 @@ fun CameraPreviewView(
     var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
     var isInitializing by remember { mutableStateOf(true) }
 
+    // Active delegate state and chip label
+    var activeDelegate by remember { mutableStateOf(Delegate.CPU) }
+    var delegateLabel by remember { mutableStateOf("CPU") }
+
     // Dedicated single-thread executor for image analysis
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
     val trackingStateHolder = remember { TrackingStateHolder() }
-    val helper = remember { HandLandmarkerHelper(context, trackingStateHolder) }
-    val analyzer = remember { CameraAnalyzer(helper, trackingStateHolder) }
+
+    // Helper holder allowing dynamic delegate switching
+    val helperState = remember {
+        mutableStateOf(HandLandmarkerHelper(context, trackingStateHolder, Delegate.CPU))
+    }
+    val analyzer = remember { CameraAnalyzer(helperState.value, trackingStateHolder) }
+
+    // Delegate toggle callback
+    val onToggleDelegate: () -> Unit = {
+        val targetDelegate = if (activeDelegate == Delegate.CPU) Delegate.GPU else Delegate.CPU
+        val oldHelper = helperState.value
+        oldHelper.close()
+
+        // Reset FPS and inference counters
+        trackingStateHolder.updateFps(0)
+        trackingStateHolder.updateResults(
+            isHandPresent = false,
+            landmarks = emptyList(),
+            inferenceTimeMs = 0L
+        )
+
+        if (targetDelegate == Delegate.GPU) {
+            try {
+                val newHelper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.GPU)
+                newHelper.overlaySizePx = oldHelper.overlaySizePx
+                newHelper.previewViewSizePx = oldHelper.previewViewSizePx
+                newHelper.previewResolution = oldHelper.previewResolution
+                helperState.value = newHelper
+                analyzer.setHelper(newHelper)
+                activeDelegate = Delegate.GPU
+                delegateLabel = "GPU"
+            } catch (e: Exception) {
+                Log.d("NoHands", "GPU delegate failed: ${e.message}")
+                val fallbackHelper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.CPU)
+                fallbackHelper.overlaySizePx = oldHelper.overlaySizePx
+                fallbackHelper.previewViewSizePx = oldHelper.previewViewSizePx
+                fallbackHelper.previewResolution = oldHelper.previewResolution
+                helperState.value = fallbackHelper
+                analyzer.setHelper(fallbackHelper)
+                activeDelegate = Delegate.CPU
+                delegateLabel = "CPU (GPU failed)"
+            }
+        } else {
+            val newHelper = HandLandmarkerHelper(context, trackingStateHolder, Delegate.CPU)
+            newHelper.overlaySizePx = oldHelper.overlaySizePx
+            newHelper.previewViewSizePx = oldHelper.previewViewSizePx
+            newHelper.previewResolution = oldHelper.previewResolution
+            helperState.value = newHelper
+            analyzer.setHelper(newHelper)
+            activeDelegate = Delegate.CPU
+            delegateLabel = "CPU"
+        }
+    }
 
     // Clean teardown capturing local vals (never delegated state)
-    DisposableEffect(analysisExecutor, helper) {
-        val executorToShutdown = analysisExecutor
-        val helperToClose = helper
+    DisposableEffect(analysisExecutor) {
         onDispose {
-            executorToShutdown.shutdown()
-            helperToClose.close()
+            analysisExecutor.shutdown()
+            helperState.value.close()
         }
     }
 
@@ -254,18 +310,31 @@ fun CameraPreviewView(
                     (previewView.parent as? ViewGroup)?.removeView(previewView)
                     previewView
                 },
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier
+                    .fillMaxSize()
+                    .onSizeChanged { size ->
+                        val sizeStr = "${size.width}x${size.height}"
+                        val resStr = getPreviewResolution(previewView)
+                        helperState.value.previewViewSizePx = sizeStr
+                        helperState.value.previewResolution = resStr
+                    }
             )
 
-            // Landmark skeleton overlay
+            // Landmark skeleton overlay with size measurement
             HandOverlay(
                 trackingState = trackingState,
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier
+                    .fillMaxSize()
+                    .onSizeChanged { size ->
+                        helperState.value.overlaySizePx = "${size.width}x${size.height}"
+                    }
             )
 
-            // Minimal non-blocking HUD
+            // Minimal non-blocking HUD with delegate toggle
             TrackingHud(
                 trackingState = trackingState,
+                delegateLabel = delegateLabel,
+                onToggleDelegate = onToggleDelegate,
                 onToggleTracking = {
                     trackingStateHolder.setTrackingActive(!trackingState.isTrackingActive)
                 },
@@ -277,11 +346,13 @@ fun CameraPreviewView(
 
 /**
  * Minimal Material 3 HUD overlay.
- * Does not intercept touch events except on the Start/Stop button.
+ * Does not intercept touch events except on interactive chips and buttons.
  */
 @Composable
 fun TrackingHud(
     trackingState: TrackingState,
+    delegateLabel: String,
+    onToggleDelegate: () -> Unit,
     onToggleTracking: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -298,8 +369,8 @@ fun TrackingHud(
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
             ) {
                 val statusText = if (!trackingState.isTrackingActive) {
                     "Stopped"
@@ -330,6 +401,21 @@ fun TrackingHud(
                     )
                 }
 
+                // Interactive Delegate Chip ("CPU", "GPU", or "CPU (GPU failed)")
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.85f),
+                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.clickable(onClick = onToggleDelegate)
+                ) {
+                    Text(
+                        text = delegateLabel,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+
                 Text(
                     text = "FPS: ${trackingState.fps}",
                     style = MaterialTheme.typography.labelMedium,
@@ -354,6 +440,39 @@ fun TrackingHud(
         ) {
             Text(if (trackingState.isTrackingActive) "Stop" else "Start")
         }
+    }
+}
+
+/**
+ * Extracts the Preview resolution from PreviewView's internal implementation if available.
+ */
+private fun getPreviewResolution(previewView: PreviewView): String {
+    return try {
+        val field = PreviewView::class.java.getDeclaredField("mImplementation")
+        field.isAccessible = true
+        val impl = field.get(previewView)
+        if (impl != null) {
+            var clazz: Class<*>? = impl.javaClass
+            var resField: java.lang.reflect.Field? = null
+            while (clazz != null && resField == null) {
+                try {
+                    resField = clazz.getDeclaredField("mResolution")
+                } catch (_: NoSuchFieldException) {
+                    clazz = clazz.superclass
+                }
+            }
+            if (resField != null) {
+                resField.isAccessible = true
+                val size = resField.get(impl) as? android.util.Size
+                if (size != null) "${size.width}x${size.height}" else "N/A"
+            } else {
+                "N/A"
+            }
+        } else {
+            "N/A"
+        }
+    } catch (_: Exception) {
+        "N/A"
     }
 }
 

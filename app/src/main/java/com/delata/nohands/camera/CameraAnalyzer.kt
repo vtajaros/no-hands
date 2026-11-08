@@ -14,13 +14,23 @@ import java.nio.ByteBuffer
  * mirrored Bitmap and feeds it to HandLandmarkerHelper.
  */
 class CameraAnalyzer(
-    private val helper: HandLandmarkerHelper,
+    initialHelper: HandLandmarkerHelper,
     private val trackingStateHolder: TrackingStateHolder
 ) : ImageAnalysis.Analyzer {
+
+    @Volatile
+    private var helper: HandLandmarkerHelper = initialHelper
 
     private var bitmapBuffer: Bitmap? = null
     private var lastTimestampMs: Long = 0L
     private var framesAnalyzedCount: Long = 0L
+
+    /**
+     * Safely updates the helper instance (e.g., when switching between CPU and GPU delegates).
+     */
+    fun setHelper(newHelper: HandLandmarkerHelper) {
+        this.helper = newHelper
+    }
 
     override fun analyze(imageProxy: ImageProxy) {
         try {
@@ -29,6 +39,7 @@ class CameraAnalyzer(
                 return
             }
 
+            val currentHelper = helper
             val width = imageProxy.width
             val height = imageProxy.height
             val rotationDegrees = imageProxy.imageInfo.rotationDegrees
@@ -96,9 +107,10 @@ class CameraAnalyzer(
             val timestampMs = if (now <= lastTimestampMs) lastTimestampMs + 1 else now
             lastTimestampMs = timestampMs
 
-            helper.detectAsync(
+            currentHelper.detectAsync(
                 bitmap = transformedBitmap,
                 rotationDegrees = rotationDegrees,
+                analysisRes = "${width}x${height}",
                 timestampMs = timestampMs,
                 framesAnalyzed = framesAnalyzedCount
             )

@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Helper to manage MediaPipe HandLandmarker in LIVE_STREAM mode.
- * Processes pre-rotated and mirrored upright bitmaps without ImageProcessingOptions.
+ * Supports dynamic CPU / GPU delegates and diagnostic logging.
  */
 class HandLandmarkerHelper(
     private val context: Context,
@@ -40,7 +40,12 @@ class HandLandmarkerHelper(
     @Volatile private var latestRotationDegrees = 0
     @Volatile private var latestRotatedWidth = 0
     @Volatile private var latestRotatedHeight = 0
+    @Volatile private var latestAnalysisRes = "N/A"
     @Volatile private var latestFramesAnalyzed = 0L
+
+    @Volatile var overlaySizePx: String = "N/A"
+    @Volatile var previewViewSizePx: String = "N/A"
+    @Volatile var previewResolution: String = "N/A"
 
     init {
         setupHandLandmarker()
@@ -77,9 +82,14 @@ class HandLandmarkerHelper(
                 .build()
 
             handLandmarker = HandLandmarker.createFromOptions(context, options)
-            Log.d(TAG, "landmarker created")
+            Log.d(TAG, "landmarker created (delegate=${delegate.name})")
         } catch (e: Exception) {
-            Log.d(TAG, "onError: Failed to create HandLandmarker: ${e.message}")
+            if (delegate == Delegate.GPU) {
+                // Rethrow so caller can catch, log "GPU delegate failed: <message>", and fall back to CPU
+                throw e
+            } else {
+                Log.d(TAG, "onError: Failed to create HandLandmarker: ${e.message}")
+            }
         }
     }
 
@@ -90,6 +100,7 @@ class HandLandmarkerHelper(
     fun detectAsync(
         bitmap: Bitmap,
         rotationDegrees: Int,
+        analysisRes: String,
         timestampMs: Long,
         framesAnalyzed: Long
     ) {
@@ -107,6 +118,7 @@ class HandLandmarkerHelper(
         latestRotationDegrees = rotationDegrees
         latestRotatedWidth = bitmap.width
         latestRotatedHeight = bitmap.height
+        latestAnalysisRes = analysisRes
         latestFramesAnalyzed = framesAnalyzed
 
         try {
@@ -181,7 +193,7 @@ class HandLandmarkerHelper(
             }
             Log.d(
                 TAG,
-                "rotationDegrees=$latestRotationDegrees, rotatedSize=${latestRotatedWidth}x${latestRotatedHeight}, landmark0=$lm0Str, resultFPS=$resultFps, inferenceMs=$inferenceTimeMs, framesAnalyzed=$latestFramesAnalyzed"
+                "delegate=${delegate.name}, overlaySize=${overlaySizePx}, previewViewSize=${previewViewSizePx}, analysisRes=${latestAnalysisRes}, previewRes=${previewResolution}, rotationDegrees=$latestRotationDegrees, rotatedSize=${latestRotatedWidth}x${latestRotatedHeight}, landmark0=$lm0Str, resultFPS=$resultFps, inferenceMs=${inferenceTimeMs}ms, framesAnalyzed=$latestFramesAnalyzed"
             )
         }
     }
