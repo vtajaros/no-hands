@@ -8,7 +8,7 @@ data class MotionConfig(
     val strokeStartSpeed: Float = 0.8f,
     val strokeKeepSpeed: Float = 0.4f,
     val minStrokeMs: Long = 100L,
-    val maxStrokeMs: Long = 700L,
+    val maxStrokeMs: Long = 1300L, // was 700L: real upward raises take 0.7-1.2 s
     val minAvgSpeedHandsPerSec: Float = 0.9f,
     val minDisplacementHands: Float = 0.30f,
     val verticalDominance: Float = 1.5f,

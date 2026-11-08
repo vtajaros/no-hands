@@ -1,6 +1,7 @@
 package com.delata.nohands.gesture
 
 import com.delata.nohands.vision.NormalizedPoint
+import kotlin.math.max
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -98,7 +99,8 @@ class MotionDetectorTest {
         val event = events.first()
         assertEquals(SwipeDirection.UP, event.direction)
         assertTrue("Displacement should be at least 0.30 hand sizes", event.displacement >= 0.30f)
-        assertTrue("Duration should be in [100, 700] ms", event.durationMs in 100L..700L)
+        val config = MotionConfig()
+        assertTrue("Duration should be in bounds", event.durationMs in config.minStrokeMs..config.maxStrokeMs)
     }
 
     @Test
@@ -400,5 +402,86 @@ class MotionDetectorTest {
             logs.any { it.startsWith("MOTION RESET loss exceeded grace period") }
         )
         assertEquals(DetectorState.SETTLING, loggedDetector.getDebugSnapshot().state)
+    }
+
+    private data class StrokeProfile(val disp: Float, val dur: Long, val avg: Float)
+
+    @Test
+    fun realWorldStrokeProfiles_emitUp() {
+        val profiles = listOf(
+            StrokeProfile(disp = 1.19f, dur = 992L, avg = 1.20f),
+            StrokeProfile(disp = 1.00f, dur = 867L, avg = 1.15f),
+            StrokeProfile(disp = 0.79f, dur = 703L, avg = 1.12f),
+            StrokeProfile(disp = 1.20f, dur = 1209L, avg = 1.00f)
+        )
+
+        val handSize = 0.20f
+        val startY = 0.70f
+
+        for (profile in profiles) {
+            val det = MotionDetector()
+            val events = mutableListOf<SwipeEvent>()
+            val startT = stabilizeHand(det, startY = startY, handSize = handSize)
+
+            val dt = 40L
+            val frameCount = max(3, (profile.dur / dt).toInt())
+            val totalDeltaNorm = profile.disp * handSize
+
+            for (i in 1..frameCount) {
+                val progress = i.toFloat() / frameCount
+                val currentT = startT + (progress * profile.dur).toLong()
+                val y = startY - totalDeltaNorm * progress
+                det.onFrame(currentT, createSyntheticHand(0.5f, y, handSize, isOpenPalm = true))?.let { events.add(it) }
+            }
+
+            var settleT = startT + profile.dur + dt
+            for (i in 0 until 5) {
+                det.onFrame(settleT, createSyntheticHand(0.5f, startY - totalDeltaNorm, handSize, isOpenPalm = true))?.let { events.add(it) }
+                settleT += dt
+            }
+
+            assertEquals("Profile $profile should emit exactly one UP event", 1, events.size)
+            val event = events.first()
+            assertEquals("Profile $profile direction should be UP", SwipeDirection.UP, event.direction)
+            assertTrue("Profile $profile displacement should be >= 0.30", event.displacement >= 0.30f)
+            assertTrue("Profile $profile duration should be in bounds", event.durationMs in MotionConfig().minStrokeMs..MotionConfig().maxStrokeMs)
+        }
+    }
+
+    @Test
+    fun strokeAboveMaxDuration_emitsNothing() {
+        // Upward stroke with duration 1400 ms (> maxStrokeMs 1300 ms) must be rejected
+        val logs = mutableListOf<String>()
+        val det = MotionDetector(log = { logs.add(it) })
+        val events = mutableListOf<SwipeEvent>()
+        val handSize = 0.20f
+        val startY = 0.70f
+        val durMs = 1400L
+        val dispHands = 1.40f // avg speed = 1.40 / 1.4 = 1.0 hand sizes/s (passes speed, fails duration)
+
+        val startT = stabilizeHand(det, startY = startY, handSize = handSize)
+
+        val dt = 40L
+        val frameCount = (durMs / dt).toInt()
+        val totalDeltaNorm = dispHands * handSize
+
+        for (i in 1..frameCount) {
+            val progress = i.toFloat() / frameCount
+            val currentT = startT + (progress * durMs).toLong()
+            val y = startY - totalDeltaNorm * progress
+            det.onFrame(currentT, createSyntheticHand(0.5f, y, handSize, isOpenPalm = true))?.let { events.add(it) }
+        }
+
+        var settleT = startT + durMs + dt
+        for (i in 0 until 5) {
+            det.onFrame(settleT, createSyntheticHand(0.5f, startY - totalDeltaNorm, handSize, isOpenPalm = true))?.let { events.add(it) }
+            settleT += dt
+        }
+
+        assertTrue("Stroke with duration 1400 ms (> 1300 ms) must emit nothing", events.isEmpty())
+        val strokeLog = logs.find { it.startsWith("MOTION STROKE") }
+        assertTrue("Expected MOTION STROKE log", strokeLog != null)
+        assertTrue("Log should show verdict=REJECT", strokeLog!!.contains("verdict=REJECT"))
+        assertTrue("Log should fail duration", strokeLog.contains("fails=[duration]"))
     }
 }
