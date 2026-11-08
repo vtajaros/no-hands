@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -55,6 +56,8 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
@@ -64,6 +67,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.delata.nohands.camera.CameraAnalyzer
 import com.delata.nohands.camera.CameraManager
+import com.delata.nohands.gesture.DetectorState
 import com.delata.nohands.gesture.GestureDebug
 import com.delata.nohands.gesture.GestureStateHolder
 import com.delata.nohands.gesture.SwipeDirection
@@ -529,25 +533,43 @@ fun TrackingHud(
     onToggleTracking: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    var isDebugVisible by rememberSaveable { mutableStateOf(true) }
+
+    // Highlight swipe counter briefly (300 ms) when swipe count increments
+    var swipeHighlighted by remember { mutableStateOf(false) }
+    LaunchedEffect(swipeCount) {
+        if (swipeCount > 0) {
+            swipeHighlighted = true
+            delay(300)
+            swipeHighlighted = false
+        }
+    }
+    val swipeColor = if (swipeHighlighted) {
+        Color(0xFF00E676)
+    } else {
+        MaterialTheme.colorScheme.primary
+    }
+
     Box(modifier = modifier) {
-        // Top status and metrics bar
-        Surface(
+        // Top status and metrics bar in a Column with two translucent surfaces
+        Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .statusBarsPadding()
                 .padding(top = 16.dp, start = 16.dp, end = 16.dp),
-            shape = RoundedCornerShape(24.dp),
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.75f),
-            tonalElevation = 4.dp
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+            // 1. Main pill (single row, never wraps)
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.75f),
+                tonalElevation = 4.dp
             ) {
-                // Line 1: Status, Delegate, FPS, Inference, Swipes
                 Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     val statusText = if (!trackingState.isTrackingActive) {
                         "Stopped"
@@ -565,17 +587,28 @@ fun TrackingHud(
                         Color(0xFFFFB300)
                     }
 
+                    // Status Chip with fixed min-width and centered text (toggles debug line)
                     Surface(
                         shape = RoundedCornerShape(12.dp),
                         color = statusColor.copy(alpha = 0.2f),
-                        contentColor = statusColor
+                        contentColor = statusColor,
+                        modifier = Modifier
+                            .widthIn(min = 96.dp)
+                            .clickable { isDebugVisible = !isDebugVisible }
                     ) {
-                        Text(
-                            text = statusText,
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
+                        Box(
+                            contentAlignment = Alignment.Center,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                        )
+                        ) {
+                            Text(
+                                text = statusText,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                        }
                     }
 
                     // Interactive Delegate Chip ("Loading...", "Switching...", "GPU", "CPU", or "CPU (GPU failed)")
@@ -595,39 +628,48 @@ fun TrackingHud(
                             text = delegateLabel,
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            softWrap = false,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                         )
                     }
 
+                    // Swipe counter (never allowed to wrap or shrink)
                     Text(
-                        text = "FPS: ${trackingState.fps}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-
-                    Text(
-                        text = "Inference: ${trackingState.inferenceTimeMs} ms",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-
-                    Text(
-                        text = "Swipes: $swipeCount",
+                        text = "Swipes $swipeCount",
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
+                        color = swipeColor,
+                        maxLines = 1,
+                        softWrap = false,
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
                     )
                 }
+            }
 
-                // Line 2: Debug metrics (detector state, windowed dy in hand sizes (2 decimals), current speed)
-                Spacer(modifier = Modifier.height(4.dp))
-                val dyStr = String.format(Locale.US, "%.2f", gestureDebug.windowedDy)
-                val spdStr = String.format(Locale.US, "%.2f", gestureDebug.speed)
-                Text(
-                    text = "${gestureDebug.state.name} | dy: ${dyStr}h | spd: ${spdStr}h/s",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+            // 2. Debug line (secondary surface directly below, 8.dp gap)
+            AnimatedVisibility(
+                visible = isDebugVisible,
+                enter = fadeIn(animationSpec = tween(150)),
+                exit = fadeOut(animationSpec = tween(150))
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.65f),
+                    tonalElevation = 2.dp
+                ) {
+                    val dyStr = String.format(Locale.US, "%.2f", gestureDebug.windowedDy)
+                    val spdStr = String.format(Locale.US, "%.2f", gestureDebug.speed)
+                    Text(
+                        text = "FPS ${trackingState.fps} · ${trackingState.inferenceTimeMs} ms · ${gestureDebug.state.name} · dy ${dyStr}h · spd ${spdStr}h/s",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                    )
+                }
             }
         }
 
@@ -801,4 +843,68 @@ private fun openAppSettings(context: Context) {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     context.startActivity(intent)
+}
+
+@Preview(name = "HUD - Searching (360dp)", widthDp = 360, showBackground = true)
+@Composable
+private fun TrackingHudSearchingPreview() {
+    MaterialTheme {
+        TrackingHud(
+            trackingState = TrackingState(isTrackingActive = true, isHandPresent = false, fps = 30, inferenceTimeMs = 33),
+            gestureDebug = GestureDebug(state = DetectorState.ARMED, windowedDy = 0.12f, speed = 0.45f),
+            swipeCount = 0,
+            delegateLabel = "GPU",
+            canToggleDelegate = true,
+            onToggleDelegate = {},
+            onToggleTracking = {}
+        )
+    }
+}
+
+@Preview(name = "HUD - Tracking 3-digit Swipes (360dp)", widthDp = 360, showBackground = true)
+@Composable
+private fun TrackingHudTrackingPreview() {
+    MaterialTheme {
+        TrackingHud(
+            trackingState = TrackingState(isTrackingActive = true, isHandPresent = true, fps = 30, inferenceTimeMs = 28),
+            gestureDebug = GestureDebug(state = DetectorState.ARMED, windowedDy = 0.85f, speed = 2.10f),
+            swipeCount = 142,
+            delegateLabel = "GPU",
+            canToggleDelegate = true,
+            onToggleDelegate = {},
+            onToggleTracking = {}
+        )
+    }
+}
+
+@Preview(name = "HUD - Stopped CPU Fallback (360dp)", widthDp = 360, showBackground = true)
+@Composable
+private fun TrackingHudStoppedFallbackPreview() {
+    MaterialTheme {
+        TrackingHud(
+            trackingState = TrackingState(isTrackingActive = false, isHandPresent = false, fps = 0, inferenceTimeMs = 0),
+            gestureDebug = GestureDebug(state = DetectorState.SETTLING, windowedDy = 0.00f, speed = 0.00f),
+            swipeCount = 21,
+            delegateLabel = "CPU (GPU failed)",
+            canToggleDelegate = true,
+            onToggleDelegate = {},
+            onToggleTracking = {}
+        )
+    }
+}
+
+@Preview(name = "HUD - Worst Case All Long (360dp)", widthDp = 360, showBackground = true)
+@Composable
+private fun TrackingHudWorstCasePreview() {
+    MaterialTheme {
+        TrackingHud(
+            trackingState = TrackingState(isTrackingActive = true, isHandPresent = false, fps = 30, inferenceTimeMs = 145),
+            gestureDebug = GestureDebug(state = DetectorState.SETTLING, windowedDy = 1.25f, speed = 3.50f),
+            swipeCount = 999,
+            delegateLabel = "CPU (GPU failed)",
+            canToggleDelegate = true,
+            onToggleDelegate = {},
+            onToggleTracking = {}
+        )
+    }
 }
