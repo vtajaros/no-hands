@@ -70,7 +70,8 @@ class TrackingStateHolder {
             current.copy(
                 isTrackingActive = active,
                 isHandPresent = if (!active) false else current.isHandPresent,
-                landmarks = if (!active) emptyList() else current.landmarks
+                landmarks = if (!active) emptyList() else current.landmarks,
+                fps = if (!active) 0 else current.fps
             )
         }
     }

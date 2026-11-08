@@ -1,17 +1,17 @@
 package com.delata.nohands.camera
 
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.os.SystemClock
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import com.delata.nohands.vision.HandLandmarkerHelper
 import com.delata.nohands.vision.TrackingStateHolder
 import java.nio.ByteBuffer
-import java.util.ArrayDeque
 
 /**
- * CameraX ImageAnalysis.Analyzer that converts RGBA_8888 ImageProxy to a reused Bitmap
- * and feeds it to HandLandmarkerHelper.
+ * CameraX ImageAnalysis.Analyzer that converts RGBA_8888 ImageProxy to an upright,
+ * mirrored Bitmap and feeds it to HandLandmarkerHelper.
  */
 class CameraAnalyzer(
     private val helper: HandLandmarkerHelper,
@@ -20,7 +20,7 @@ class CameraAnalyzer(
 
     private var bitmapBuffer: Bitmap? = null
     private var lastTimestampMs: Long = 0L
-    private val frameTimestamps = ArrayDeque<Long>()
+    private var framesAnalyzedCount: Long = 0L
 
     override fun analyze(imageProxy: ImageProxy) {
         try {
@@ -33,12 +33,7 @@ class CameraAnalyzer(
             val height = imageProxy.height
             val rotationDegrees = imageProxy.imageInfo.rotationDegrees
 
-            // Upright dimensions accounting for rotation
-            val uprightWidth = if (rotationDegrees == 90 || rotationDegrees == 270) height else width
-            val uprightHeight = if (rotationDegrees == 90 || rotationDegrees == 270) width else height
-            trackingStateHolder.updateImageDimensions(uprightWidth, uprightHeight)
-
-            // Re-allocate bitmapBuffer only if dimensions change
+            // Re-allocate raw bitmapBuffer only if sensor dimensions change
             var bitmap = bitmapBuffer
             if (bitmap == null || bitmap.width != width || bitmap.height != height) {
                 bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -65,19 +60,48 @@ class CameraAnalyzer(
                 bitmap.copyPixelsFromBuffer(tempBuffer)
             }
 
+            // Create upright, mirrored bitmap using Matrix:
+            // postRotate(imageInfo.rotationDegrees), then, because this is the front camera,
+            // postScale(-1f, 1f) about the center of the rotated image.
+            val rotDegFloat = rotationDegrees.toFloat()
+            val isRotated = (rotationDegrees == 90 || rotationDegrees == 270)
+            val rotatedW = if (isRotated) height else width
+            val rotatedH = if (isRotated) width else height
+
+            val matrix = Matrix().apply {
+                postRotate(rotDegFloat)
+                postScale(-1f, 1f, rotatedW / 2f, rotatedH / 2f)
+            }
+
+            val transformedBitmap = Bitmap.createBitmap(
+                bitmap,
+                0,
+                0,
+                width,
+                height,
+                matrix,
+                false
+            )
+
+            // Publish imageWidth and imageHeight to TrackingState from the ROTATED bitmap
+            trackingStateHolder.updateImageDimensions(
+                transformedBitmap.width,
+                transformedBitmap.height
+            )
+
+            framesAnalyzedCount++
+
             // Timestamps must strictly increase
             val now = SystemClock.uptimeMillis()
             val timestampMs = if (now <= lastTimestampMs) lastTimestampMs + 1 else now
             lastTimestampMs = timestampMs
 
-            // Compute processed FPS over rolling ~1 second
-            frameTimestamps.addLast(now)
-            while (frameTimestamps.isNotEmpty() && now - frameTimestamps.first() > 1000L) {
-                frameTimestamps.removeFirst()
-            }
-            trackingStateHolder.updateFps(frameTimestamps.size)
-
-            helper.detectAsync(bitmap, rotationDegrees, timestampMs)
+            helper.detectAsync(
+                bitmap = transformedBitmap,
+                rotationDegrees = rotationDegrees,
+                timestampMs = timestampMs,
+                framesAnalyzed = framesAnalyzedCount
+            )
         } finally {
             imageProxy.close()
         }

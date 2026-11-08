@@ -9,6 +9,11 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.unit.dp
 
 /**
+ * Control flag for debug visual aids (wrist in green, index fingertip in yellow).
+ */
+const val DEBUG_OVERLAY = true
+
+/**
  * Standard 21 MediaPipe hand landmark connections.
  */
 val HAND_CONNECTIONS: List<Pair<Int, Int>> = listOf(
@@ -28,7 +33,8 @@ val HAND_CONNECTIONS: List<Pair<Int, Int>> = listOf(
 
 /**
  * Canvas drawing the 21 hand landmarks and skeleton connections over the front camera preview.
- * Maps upright normalized coordinates to the FILL_CENTER scaled and mirrored preview coordinates.
+ * Since the input image is already rotated and mirrored to match the preview, coordinates
+ * are directly mapped to the FILL_CENTER scaled preview frame without an x-flip.
  */
 @Composable
 fun HandOverlay(
@@ -56,20 +62,18 @@ fun HandOverlay(
 
         if (viewW <= 0f || viewH <= 0f) return@Canvas
 
-        // scale = max(viewW/imgW, viewH/imgH) with a centered crop offset
+        // scale = max(viewW/imgW, viewH/imgH) with centered crop offset
         val scale = maxOf(viewW / imgW, viewH / imgH)
         val scaledW = imgW * scale
         val scaledH = imgH * scale
         val offsetX = (viewW - scaledW) / 2f
         val offsetY = (viewH - scaledH) / 2f
 
-        // Front camera preview is mirrored, so flip x (x' = 1 - x)
+        // The bitmap is already mirrored, so no x-flip (x' = x)
         val screenPoints = landmarks.map { pt ->
-            val flippedX = 1f - pt.x
-            val flippedY = pt.y
             Offset(
-                x = offsetX + (flippedX * scaledW),
-                y = offsetY + (flippedY * scaledH)
+                x = offsetX + (pt.x * scaledW),
+                y = offsetY + (pt.y * scaledH)
             )
         }
 
@@ -90,12 +94,28 @@ fun HandOverlay(
         }
 
         // Draw landmark dots
-        for (point in screenPoints) {
-            drawCircle(
-                color = pointColor,
-                radius = pointRadius,
-                center = point
-            )
+        for ((index, point) in screenPoints.withIndex()) {
+            if (DEBUG_OVERLAY && index == 0) {
+                // Landmark 0 (wrist): larger green dot
+                drawCircle(
+                    color = Color(0xFF00E676), // Bright Green
+                    radius = pointRadius * 1.8f,
+                    center = point
+                )
+            } else if (DEBUG_OVERLAY && index == 8) {
+                // Landmark 8 (index fingertip): larger yellow dot
+                drawCircle(
+                    color = Color(0xFFFFEA00), // Bright Yellow
+                    radius = pointRadius * 1.8f,
+                    center = point
+                )
+            } else {
+                drawCircle(
+                    color = pointColor,
+                    radius = pointRadius,
+                    center = point
+                )
+            }
         }
     }
 }
